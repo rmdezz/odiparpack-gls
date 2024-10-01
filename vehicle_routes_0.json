@@ -1,0 +1,54 @@
+[
+  {
+    "vehicleCode": "A001",
+    "steps": [
+      {
+        "ubigeo": "150101",
+        "latitude": -12.0464,
+        "longitude": -77.0428,
+        "arrivalTime": 0,
+        "departureTime": 0
+      },
+      {
+        "ubigeo": "040101",
+        "latitude": -16.409,
+        "longitude": -71.5375,
+        "arrivalTime": 919,
+        "departureTime": 919
+      },
+      {
+        "ubigeo": "150101",
+        "latitude": -12.0464,
+        "longitude": -77.0428,
+        "arrivalTime": 1838,
+        "departureTime": 1838
+      }
+    ]
+  },
+  {
+    "vehicleCode": "B001",
+    "steps": [
+      {
+        "ubigeo": "150101",
+        "latitude": -12.0464,
+        "longitude": -77.0428,
+        "arrivalTime": 0,
+        "departureTime": 0
+      },
+      {
+        "ubigeo": "130101",
+        "latitude": -8.1112,
+        "longitude": -79.0283,
+        "arrivalTime": 488,
+        "departureTime": 488
+      },
+      {
+        "ubigeo": "150101",
+        "latitude": -12.0464,
+        "longitude": -77.0428,
+        "arrivalTime": 976,
+        "departureTime": 976
+      }
+    ]
+  }
+]

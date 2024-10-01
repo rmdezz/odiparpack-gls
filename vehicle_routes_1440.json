@@ -1,0 +1,28 @@
+[
+  {
+    "vehicleCode": "A001",
+    "steps": [
+      {
+        "ubigeo": "150101",
+        "latitude": -12.0464,
+        "longitude": -77.0428,
+        "arrivalTime": 0,
+        "departureTime": 0
+      },
+      {
+        "ubigeo": "130101",
+        "latitude": -8.1112,
+        "longitude": -79.0283,
+        "arrivalTime": 488,
+        "departureTime": 488
+      },
+      {
+        "ubigeo": "150101",
+        "latitude": -12.0464,
+        "longitude": -77.0428,
+        "arrivalTime": 976,
+        "departureTime": 976
+      }
+    ]
+  }
+]
