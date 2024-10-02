@@ -8,7 +8,11 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
+import static com.odiparpack.DataLoader.getUbigeoFromName;
 import static com.odiparpack.Main.locations;
 import static com.odiparpack.Main.logger;
 
@@ -23,6 +27,7 @@ public class Vehicle {
         AVERIADO_1,
         AVERIADO_2,
         AVERIADO_3,
+        EN_MANTENIMIENTO
     }
 
     private String code;
@@ -65,7 +70,40 @@ public class Vehicle {
         this.waitStartTime = waitStartTime;
     }
 
+    public void handleBreakdown(LocalDateTime currentTime, EstadoVehiculo tipoAveria) {
+        this.estado = tipoAveria;
+        this.setAvailable(false);
 
+        long repairHours;
+        switch (tipoAveria) {
+            case AVERIADO_1:
+                repairHours = 4;
+                break;
+            case AVERIADO_2:
+                repairHours = 36;
+                break;
+            case AVERIADO_3:
+                repairHours = 72;
+                break;
+            default:
+                logger.warning("Tipo de avería no reconocido");
+                return;
+        }
+
+        LocalDateTime repairEndTime = currentTime.plusHours(repairHours);
+
+        logger.info(String.format("Vehículo %s ha sufrido una avería tipo %s en %s. Estará detenido hasta %s",
+                this.getCode(), tipoAveria, this.getCurrentLocationUbigeo(), repairEndTime));
+
+        // Programar la reparación
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        executor.schedule(() -> {
+            this.estado = EstadoVehiculo.EN_ALMACEN; // Asumimos que vuelve al almacén después de la reparación
+            this.setAvailable(true);
+            logger.info(String.format("Vehículo %s ha sido reparado y está nuevamente disponible en el almacén", this.getCode()));
+            executor.shutdown();
+        }, repairHours, TimeUnit.HOURS);
+    }
 
     public Order getCurrentOrder() {
         return currentOrder;
@@ -163,9 +201,16 @@ public class Vehicle {
         } else {
             String[] segment = status.getCurrentSegment().split(" to ");
             String toName = segment[1];
-            currentLocationUbigeo = toName;
-            logger.info(String.format("Ubicacion actual actualizada del vehiculo %s a: %s.",
-                    getCode(), getCurrentLocationUbigeo()));
+
+            // Obtener el ubigeo a partir del nombre de la ubicación
+            currentLocationUbigeo = getUbigeoFromName(toName);
+
+            if (currentLocationUbigeo != null) {
+                logger.info(String.format("Ubicacion actual actualizada del vehiculo %s a: %s (%s).",
+                        getCode(), currentLocationUbigeo, toName));
+            } else {
+                logger.warning(String.format("No se encontró el ubigeo para la ubicación: %s", toName));
+            }
         }
         resetVehicleStatus();
     }
@@ -273,6 +318,10 @@ public class Vehicle {
 
         if (estado == EstadoVehiculo.HACIA_ALMACEN) {
             estado = EstadoVehiculo.EN_ALMACEN;
+            logger.info(String.format("Estado del vehiculo %s actualizado a: EN ALMACEN - %s (%s)",
+                    getCode(),
+                    locations.get(getCurrentLocationUbigeo()).getProvince(),
+                    getCurrentLocationUbigeo()));
         } else if (estado == EstadoVehiculo.EN_TRANSITO_ORDEN) {
             estado = EstadoVehiculo.EN_ESPERA_EN_OFICINA;
         }

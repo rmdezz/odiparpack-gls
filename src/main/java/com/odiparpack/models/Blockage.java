@@ -2,7 +2,7 @@ package com.odiparpack.models;
 
 import java.time.LocalDateTime;
 
-public class Blockage {
+public class Blockage implements Cloneable {
     private String originUbigeo;
     private String destinationUbigeo;
     private LocalDateTime startTime;
@@ -16,9 +16,28 @@ public class Blockage {
         this.endTime = endTime;
     }
 
+    @Override
+    public String toString() {
+        return "Blockage{" +
+                "from=" + originUbigeo +
+                ", to=" + destinationUbigeo +
+                "}";
+    }
+
     // Getters
     public String getOriginUbigeo() { return originUbigeo; }
     public String getDestinationUbigeo() { return destinationUbigeo; }
     public LocalDateTime getStartTime() { return startTime; }
     public LocalDateTime getEndTime() { return endTime; }
+
+    // Implementación del método clone()
+    @Override
+    public Blockage clone() {
+        try {
+            return (Blockage) super.clone();
+        } catch (CloneNotSupportedException e) {
+            // Esto no debería ocurrir porque estamos implementando Cloneable
+            throw new AssertionError();
+        }
+    }
 }

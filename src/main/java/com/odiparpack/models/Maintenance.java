@@ -1,19 +1,30 @@
 package com.odiparpack.models;
+import java.time.LocalDateTime;
 
 public class Maintenance {
     private String vehicleCode;
-    private long startTime; // Timestamp
-    private long endTime;   // Timestamp
+    private LocalDateTime startTime;
+    private LocalDateTime endTime;
 
-    // Constructor
-    public Maintenance(String vehicleCode, long startTime, long endTime) {
+    public Maintenance(String vehicleCode, LocalDateTime startTime, LocalDateTime endTime) {
         this.vehicleCode = vehicleCode;
         this.startTime = startTime;
-        this.endTime = endTime;
+        this.endTime = endTime;  // Ajuste para la Nota 1
     }
 
-    // Getters
-    public String getVehicleCode() { return vehicleCode; }
-    public long getStartTime() { return startTime; }
-    public long getEndTime() { return endTime; }
+    public String getVehicleCode() {
+        return vehicleCode;
+    }
+
+    public LocalDateTime getStartTime() {
+        return startTime;
+    }
+
+    public LocalDateTime getEndTime() {
+        return endTime;
+    }
+
+    public boolean isInMaintenancePeriod(LocalDateTime currentTime) {
+        return !currentTime.isBefore(startTime) && currentTime.isBefore(endTime);
+    }
 }

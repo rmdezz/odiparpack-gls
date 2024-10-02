@@ -40,6 +40,7 @@ public class Main {
         List<Vehicle> vehicles = dataLoader.loadVehicles("src/main/resources/vehicles.txt");
         List<Order> orders = dataLoader.loadOrders("src/main/resources/orders.txt", locations);
         List<Blockage> blockages = dataLoader.loadBlockages("src/main/resources/blockages.txt");
+        List<Maintenance> maintenanceSchedule = dataLoader.loadMaintenanceSchedule("src/main/resources/maintenance.txt");
 
         routeCache = new RouteCache(ROUTE_CACHE_CAPACITY);
 
@@ -81,7 +82,7 @@ public class Main {
 
         // Iniciar simulación
         runSimulation(timeMatrix, orders, vehicles, locationIndices, locationNames, locationUbigeos, locations, routeCache,
-                blockages);
+                blockages, maintenanceSchedule);
 
         /*// Calcular la ruta de ida
         logger.info("Calculando ruta de ida (Almacén -> Destino Final):");
@@ -111,8 +112,8 @@ public class Main {
     private static void runSimulation(long[][] timeMatrix, List<Order> allOrders, List<Vehicle> vehicles,
                                       Map<String, Integer> locationIndices, List<String> locationNames,
                                       List<String> locationUbigeos, Map<String, Location> locations,
-                                      RouteCache routeCache, List<Blockage> blockages) {
-        SimulationState state = initializeSimulation(allOrders, vehicles, locations, routeCache, timeMatrix, blockages);
+                                      RouteCache routeCache, List<Blockage> blockages, List<Maintenance> maintenanceSchedule) {
+        SimulationState state = initializeSimulation(allOrders, vehicles, locations, routeCache, timeMatrix, blockages, maintenanceSchedule);
         Map<String, List<RouteSegment>> vehicleRoutes = new HashMap<>();
         ScheduledExecutorService executorService = setupExecutors();
 
@@ -127,11 +128,11 @@ public class Main {
     }
 
     private static SimulationState initializeSimulation(List<Order> allOrders, List<Vehicle> vehicles, Map<String,
-            Location> locations, RouteCache routeCache, long[][] timeMatrix, List<Blockage> blockages) {
+            Location> locations, RouteCache routeCache, long[][] timeMatrix, List<Blockage> blockages, List<Maintenance> maintenanceSchedule) {
         LocalDateTime initialSimulationTime = determineInitialSimulationTime(allOrders);
         Map<String, Vehicle> vehicleMap = createVehicleMap(vehicles);
         return new SimulationState(vehicleMap, initialSimulationTime, allOrders, locations, routeCache,
-                timeMatrix, blockages);
+                timeMatrix, blockages, maintenanceSchedule);
     }
 
     private static LocalDateTime determineInitialSimulationTime(List<Order> allOrders) {
@@ -162,6 +163,7 @@ public class Main {
         schedulePlanning(state, allOrders, locationIndices, locationNames, locationUbigeos, vehicleRoutes, executorService, isSimulationRunning);
 
         while (isSimulationRunning.get()) {
+            state.checkForBreakdownCommands();
             Thread.sleep(1000);
         }
     }
@@ -202,7 +204,6 @@ public class Main {
 
             try {
                 long[][] currentTimeMatrix = state.getCurrentTimeMatrix();
-
                 List<Order> availableOrders = getAvailableOrders(allOrders, state.getCurrentTime());
                 logAvailableOrders(availableOrders);
 
@@ -230,7 +231,7 @@ public class Main {
                                                 Map<String, Integer> locationIndices, List<String> locationNames,
                                                 List<String> locationUbigeos, Map<String, List<RouteSegment>> vehicleRoutes,
                                                 SimulationState state, ExecutorService executorService) {
-        DataModel data = new DataModel(currentTimeMatrix, assignments, locationIndices, locationNames, locationUbigeos);
+        DataModel data = new DataModel(currentTimeMatrix, state.getActiveBlockages(), assignments, locationIndices, locationNames, locationUbigeos);
         executorService.submit(() -> {
             try {
                 Map<String, List<RouteSegment>> newRoutes = calculateRoute(data, data.starts, data.ends, state);
@@ -290,7 +291,9 @@ public class Main {
         return vehicleRoutes;
     }
 
-    private static Map<String, List<RouteSegment>> extractCalculatedRoutes(RoutingIndexManager manager, DataModel data, List<VehicleAssignment> assignments, RoutingModel routing, Assignment solution) {
+    private static Map<String, List<RouteSegment>> extractCalculatedRoutes(List<Blockage> activeBlockages, RoutingIndexManager manager, DataModel data,
+                                                                           List<VehicleAssignment> assignments,
+                                                                           RoutingModel routing, Assignment solution) {
         Map<String, List<RouteSegment>> calculatedRoutes = new HashMap<>();
         for (int i = 0; i < assignments.size(); ++i) {
             VehicleAssignment assignment = assignments.get(i);
@@ -317,6 +320,13 @@ public class Main {
             }
 
             calculatedRoutes.put(vehicle.getCode(), route);
+
+            // Añadir la ruta calculada al caché
+            routeCache.putRoute(data.locationUbigeos.get(data.starts[i]),
+                    data.locationUbigeos.get(data.ends[i]),
+                    route,
+                    activeBlockages);
+
             logger.info("Ruta calculada para el vehículo " + vehicle.getCode() + " con " + route.size() + " segmentos.");
         }
         return calculatedRoutes;
@@ -459,7 +469,11 @@ public class Main {
     }
 
     private static List<Vehicle> getAvailableVehicles(List<Vehicle> vehicles, String locationUbigeo) {
+        // Loguear el origen del ubigeo de la orden antes del filtrado
+        logger.info(String.format("Ubigeo de origen de la orden: %s", locationUbigeo));
+
         return vehicles.stream()
+                .peek(v -> logger.info(String.format("Ubigeo actual del vehículo %s: %s", v.getCode(), v.getCurrentLocationUbigeo())))
                 .filter(v -> v.getEstado() == Vehicle.EstadoVehiculo.EN_ALMACEN && v.getCurrentLocationUbigeo().equals(locationUbigeo))
                 .collect(Collectors.toList());
     }
@@ -498,14 +512,14 @@ public class Main {
         Map<String, List<RouteSegment>> allRoutes = new HashMap<>();
 
         try {
-            Map<String, List<RouteSegment>> cachedRoutes = getCachedRoutes(data, start, end, state.getActiveBlockages());
+            Map<String, List<RouteSegment>> cachedRoutes = getCachedRoutes(data, start, end);
             allRoutes.putAll(cachedRoutes);
 
             if (cachedRoutes.size() < data.vehicleNumber) {
                 logger.info("Se necesitan calcular rutas adicionales. Rutas en caché: " + cachedRoutes.size() + ", Vehículos totales: " + data.vehicleNumber);
-                Map<String, List<RouteSegment>> calculatedRoutes = calculateMissingRoutes(data, start, end, state, cachedRoutes);
+                Map<String, List<RouteSegment>> calculatedRoutes = calculateMissingRoutes(data, start, end, cachedRoutes); // y almacena en cache
                 allRoutes.putAll(calculatedRoutes);
-                updateRouteCache(data, start, end, calculatedRoutes);
+                //updateRouteCache(data, start, end, calculatedRoutes);
             } else {
                 logger.info("Todas las rutas fueron encontradas en caché.");
                 logAllCachedRoutes(cachedRoutes);
@@ -523,7 +537,7 @@ public class Main {
     }
 
     private static Map<String, List<RouteSegment>> calculateMissingRoutes(DataModel data, int[] start, int[] end,
-                                                                          SimulationState state, Map<String, List<RouteSegment>> existingRoutes) {
+                                                                          Map<String, List<RouteSegment>> existingRoutes) {
         // Crear una nueva DataModel solo con las rutas que faltan
         DataModel missingData = createMissingDataModel(data, start, end, existingRoutes);
         RoutingIndexManager manager = createRoutingIndexManager(missingData, missingData.starts, missingData.ends);
@@ -538,7 +552,7 @@ public class Main {
         logger.info("Solución de rutas obtenida para rutas faltantes.");
 
         if (solution != null) {
-            Map<String, List<RouteSegment>> calculatedRoutes = extractCalculatedRoutes(manager, missingData, missingData.assignments, routing, solution);
+            Map<String, List<RouteSegment>> calculatedRoutes = extractCalculatedRoutes(data.activeBlockages, manager, missingData, missingData.assignments, routing, solution);
             //Map<String, List<RouteSegment>> calculatedRoutes = applyRouteToVehicles(manager, missingData, missingData.assignments, routing, solution, state);
             printSolution(missingData, routing, manager, solution);
             logger.info("Solución de rutas faltantes impresa correctamente.");
@@ -585,6 +599,7 @@ public class Main {
         logger.info("Verifiquemos el valor del tramo LUYA - BONGARA");
         return new DataModel(
                 originalData.timeMatrix,
+                originalData.activeBlockages,
                 missingAssignments,
                 locationIndices,
                 originalData.locationNames,
@@ -592,14 +607,14 @@ public class Main {
         );
     }
 
-    private static Map<String, List<RouteSegment>> getCachedRoutes(DataModel data, int[] start, int[] end, List<Blockage> activeBlockages) {
+    private static Map<String, List<RouteSegment>> getCachedRoutes(DataModel data, int[] start, int[] end) {
         Map<String, List<RouteSegment>> cachedRoutes = new HashMap<>();
         for (int i = 0; i < data.vehicleNumber; i++) {
             String fromUbigeo = data.locationUbigeos.get(start[i]);
             String toUbigeo = data.locationUbigeos.get(end[i]);
             String vehicleCode = data.assignments.get(i).getVehicle().getCode();
 
-            List<RouteSegment> cachedRoute = routeCache.getRoute(fromUbigeo, toUbigeo, activeBlockages);
+            List<RouteSegment> cachedRoute = routeCache.getRoute(fromUbigeo, toUbigeo, data.activeBlockages);
             if (cachedRoute != null) {
                 cachedRoutes.put(vehicleCode, cachedRoute);
                 logCachedRoute(vehicleCode, fromUbigeo, toUbigeo, cachedRoute);
@@ -617,14 +632,17 @@ public class Main {
         logBuilder.append("Origen (Ubigeo): ").append(fromUbigeo).append("\n");
         logBuilder.append("Destino (Ubigeo): ").append(toUbigeo).append("\n");
         logBuilder.append("Segmentos de la ruta:\n");
+        double totalDuration = 0;
         for (int i = 0; i < route.size(); i++) {
             RouteSegment segment = route.get(i);
+            totalDuration += segment.getDurationMinutes();
             logBuilder.append("  ").append(i + 1).append(". ")
                     .append("Nombre: ").append(segment.getName())
                     .append(", Ubigeo: ").append(segment.getUbigeo())
                     .append(", Distancia: ").append(segment.getDistance()).append(" km")
                     .append(", Duración: ").append(segment.getDurationMinutes()).append(" minutos\n");
         }
+        logBuilder.append("Duración total de la ruta: ").append(totalDuration).append(" minutos\n");
         logBuilder.append("-----------------------------");
         logger.info(logBuilder.toString());
     }
@@ -704,7 +722,7 @@ public class Main {
         return searchParameters;
     }
 
-    private static void updateRouteCache(DataModel data, int[] start, int[] end, Map<String, List<RouteSegment>> calculatedRoutes) {
+    /*private static void updateRouteCache(DataModel data, int[] start, int[] end, Map<String, List<RouteSegment>> calculatedRoutes) {
         for (int i = 0; i < data.vehicleNumber; i++) {
             String vehicleCode = data.assignments.get(i).getVehicle().getCode();
             if (calculatedRoutes.containsKey(vehicleCode)) {
@@ -716,7 +734,7 @@ public class Main {
                 logCachedRoute(data, vehicleCode, fromUbigeo, toUbigeo, route);
             }
         }
-    }
+    }*/
 
     private static void logCachedRoute(DataModel data, String vehicleCode, String fromUbigeo, String toUbigeo, List<RouteSegment> route) {
         StringBuilder logBuilder = new StringBuilder();

@@ -10,7 +10,9 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.*;
+import java.util.logging.Level;
 
 import static com.odiparpack.Main.logger;
 
@@ -18,6 +20,8 @@ public class DataLoader {
     private static final double TIME_UNIT = 60000.0; // 1 minuto en milisegundos
     // Mapa que relaciona ubigeos con nombres de ubicaciones
     public static Map<String, String> ubigeoToNameMap = new HashMap<>();
+    // Mapa que relaciona nombres de ubicaciones con ubigeos
+    public static Map<String, String> nameToUbigeoMap = new HashMap<>();
 
     public Map<String, Location> loadLocations(String filePath) {
         Map<String, Location> locations = new HashMap<>();
@@ -40,6 +44,9 @@ public class DataLoader {
 
                 // Población automática de ubigeoToNameMap
                 ubigeoToNameMap.put(ubigeo, province);
+
+                // Población de nameToUbigeoMap
+                nameToUbigeoMap.put(province, ubigeo);
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -337,26 +344,48 @@ public class DataLoader {
 
     public List<Maintenance> loadMaintenanceSchedule(String filePath) {
         List<Maintenance> maintenances = new ArrayList<>();
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd");
+        DateTimeFormatter outputFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+
+        logger.info("Iniciando carga del plan de mantenimiento desde: " + filePath);
+
         try (BufferedReader br = new BufferedReader(new FileReader(filePath))) {
             String line;
+            int lineNumber = 0;
             while ((line = br.readLine()) != null) {
+                lineNumber++;
                 if (line.trim().isEmpty() || line.startsWith("#")) continue;
-                // Formato: VehicleCode,mmdd-inicio,hh:mm-inicio,mmdd-fin,hh:mm-fin
-                String[] parts = line.split(",");
-                if (parts.length < 5) continue;
-                String vehicleCode = parts[0].trim();
-                String startStr = parts[1].trim() + "," + parts[2].trim();
-                String endStr = parts[3].trim() + "," + parts[4].trim();
+                String[] parts = line.split(":");
+                if (parts.length != 2) {
+                    logger.warning("Línea " + lineNumber + " mal formateada: " + line);
+                    continue;
+                }
 
-                long startTime = Utils.parseBlockageDateTimeToTimestamp(startStr);
-                long endTime = Utils.parseBlockageDateTimeToTimestamp(endStr);
+                String dateStr = parts[0];
+                String vehicleCode = parts[1];
 
-                Maintenance maintenance = new Maintenance(vehicleCode, startTime, endTime);
-                maintenances.add(maintenance);
+                try {
+                    LocalDate date = LocalDate.parse(dateStr, formatter);
+                    LocalDateTime startTime = date.atStartOfDay();
+                    LocalDateTime endTime = date.plusDays(0).atTime(1, 0);
+
+                    Maintenance maintenance = new Maintenance(vehicleCode, startTime, endTime);
+                    maintenances.add(maintenance);
+
+                    logger.info(String.format("Mantenimiento cargado - Vehículo: %s, Inicio: %s, Fin: %s",
+                            vehicleCode,
+                            startTime.format(outputFormatter),
+                            endTime.format(outputFormatter)));
+                } catch (DateTimeParseException e) {
+                    logger.warning("Error al parsear la fecha en la línea " + lineNumber + ": " + dateStr);
+                }
             }
         } catch (IOException e) {
-            e.printStackTrace();
+            logger.log(Level.SEVERE, "Error al cargar el plan de mantenimiento", e);
         }
+
+        logger.info("Carga del plan de mantenimiento completada. Total de mantenimientos: " + maintenances.size());
+
         return maintenances;
     }
 
@@ -368,5 +397,18 @@ public class DataLoader {
     public Map<String, String> getUbigeoToNameMap() {
         return Collections.unmodifiableMap(ubigeoToNameMap);
     }
+
+    public static String getUbigeoFromName(String locationName) {
+        // Verificar si el mapa contiene el nombre de la ubicación
+        if (nameToUbigeoMap.containsKey(locationName)) {
+            // Devolver el ubigeo correspondiente
+            return nameToUbigeoMap.get(locationName);
+        } else {
+            // Si no se encuentra la ubicación, loguear una advertencia y devolver null
+            logger.warning(String.format("No se encontró el ubigeo para la ubicación: %s", locationName));
+            return null;
+        }
+    }
+
 
 }
