@@ -15,6 +15,7 @@ import java.util.concurrent.TimeUnit;
 import static com.odiparpack.DataLoader.getUbigeoFromName;
 import static com.odiparpack.Main.locations;
 import static com.odiparpack.Main.logger;
+import static com.odiparpack.models.SimulationState.addBreakdownLog;
 
 public class Vehicle {
     public enum EstadoVehiculo {
@@ -38,6 +39,130 @@ public class Vehicle {
     private String homeUbigeo;
     private VehicleStatus status;
     private boolean isRouteBeingCalculated;
+    private LocalDateTime repairEndTime;
+    private Order currentOrder;
+    private List<RouteSegment> route;
+    private int currentSegmentIndex; // Índice del tramo actual en la ruta
+    private long elapsedTimeInSegment; // Tiempo transcurrido en el tramo actual (en minutos)
+    LocalDateTime estimatedDeliveryTime;
+    private long totalAveriaTime; // Tiempo total en estado de avería (en minutos)
+    private LocalDateTime averiaStartTime; // Tiempo de inicio de la avería
+
+    public long getTotalAveriaTime() {
+        return totalAveriaTime;
+    }
+
+    public void setTotalAveriaTime(long totalAveriaTime) {
+        this.totalAveriaTime = totalAveriaTime;
+    }
+
+    public LocalDateTime getAveriaStartTime() {
+        return averiaStartTime;
+    }
+
+    public void setAveriaStartTime(LocalDateTime averiaStartTime) {
+        this.averiaStartTime = averiaStartTime;
+    }
+
+    public boolean isInMaintenance() {
+        return this.estado == EstadoVehiculo.EN_MANTENIMIENTO;
+    }
+
+    public boolean isUnderRepair() {
+        return this.estado == EstadoVehiculo.AVERIADO_1 ||
+                this.estado == EstadoVehiculo.AVERIADO_2 ||
+                this.estado == EstadoVehiculo.AVERIADO_3;
+    }
+
+    public boolean hasCompletedRepair(LocalDateTime currentTime) {
+        return this.repairEndTime != null && !currentTime.isBefore(this.repairEndTime);
+    }
+
+    /**
+     * Inicia el seguimiento del tiempo de avería.
+     */
+    public void startAveria(LocalDateTime currentTime) {
+        this.averiaStartTime = currentTime;
+        this.totalAveriaTime = 0;
+    }
+
+    /**
+     * Actualiza el tiempo total de avería basado en el tiempo actual.
+     */
+    public void updateAveriaTime(LocalDateTime currentTime) {
+        if (this.averiaStartTime != null) {
+            // Calcular el tiempo transcurrido desde el inicio de la avería hasta el currentTime
+            long minutesSinceAveriaStart = ChronoUnit.MINUTES.between(this.averiaStartTime, currentTime);
+
+            // Actualizar el tiempo total de avería
+            this.totalAveriaTime += minutesSinceAveriaStart;
+
+            // Registrar el tiempo transcurrido desde que comenzó la avería
+            logger.info(String.format("Vehículo %s ha estado averiado durante %d minutos desde que ocurrió la avería inicialmente.",
+                    this.getCode(), minutesSinceAveriaStart));
+        }
+    }
+
+    /**
+     * Finaliza el seguimiento del tiempo de avería.
+     */
+    public void endAveria() {
+        this.averiaStartTime = null;
+    }
+
+    public void continueCurrentRoute(LocalDateTime currentTime) {
+        this.estado = EstadoVehiculo.EN_TRANSITO_ORDEN;
+        this.setAvailable(true);
+
+        // Lógica para continuar la ruta actual
+        if (this.route != null && this.currentSegmentIndex < this.route.size()) {
+            RouteSegment currentSegment = this.route.get(this.currentSegmentIndex);
+            long remainingTimeInSegment = currentSegment.getDurationMinutes() - this.elapsedTimeInSegment;
+
+            // Actualizar el tiempo estimado de entrega sumando el tiempo de reparación (solo para avería tipo 1)
+            if (this.estado == EstadoVehiculo.AVERIADO_1) {
+                this.estimatedDeliveryTime = this.estimatedDeliveryTime.plusHours(4); // Ajustar según el tiempo de reparación
+            }
+
+            logger.info(String.format("Vehículo %s reanudará el tramo %d: %s. Tiempo restante en el tramo: %d minutos.",
+                    this.getCode(),
+                    this.currentSegmentIndex + 1,
+                    currentSegment.getName(),
+                    remainingTimeInSegment));
+
+            // Actualizar el tiempo de fin del tramo
+            this.status.setEstimatedArrivalTime(this.status.getEstimatedArrivalTime().plusHours(4));  // Agregar 4 horas adicionales
+
+            // Finalizar el seguimiento del tiempo de avería
+            this.endAveria();
+
+            // Registrar la continuación de la ruta
+            logger.info(String.format("Vehículo %s ha reanudado su ruta en el tramo %d: %s.",
+                    this.getCode(),
+                    this.currentSegmentIndex + 1,
+                    currentSegment.getName()));
+        } else {
+            logger.warning(String.format("Vehículo %s no tiene una ruta válida para continuar.", this.getCode()));
+        }
+    }
+
+
+    public void clearRepairTime() {
+        this.repairEndTime = null;
+    }
+
+
+    public boolean shouldUpdateStatus() {
+        return this.estado == EstadoVehiculo.EN_TRANSITO_ORDEN ||
+                this.estado == EstadoVehiculo.HACIA_ALMACEN ||
+                this.estado == EstadoVehiculo.EN_ESPERA_EN_OFICINA;
+    }
+
+    public boolean shouldCalculateNewRoute(LocalDateTime currentTime) {
+        return this.estado == EstadoVehiculo.LISTO_PARA_RETORNO && !this.isRouteBeingCalculated() &&
+                (this.getWaitStartTime() == null ||
+                        ChronoUnit.MINUTES.between(this.getWaitStartTime(), currentTime) >= WAIT_TIME_MINUTES);
+    }
 
     public EstadoVehiculo getEstado() {
         return estado;
@@ -52,6 +177,22 @@ public class Vehicle {
 
     public boolean isListoParaRegresarAlmacen() {
         return listoParaRegresarAlmacen;
+    }
+
+    public LocalDateTime getRepairEndTime() {
+        return repairEndTime;
+    }
+
+    public long getElapsedTimeInSegment() {
+        return this.elapsedTimeInSegment;
+    }
+
+    public void setElapsedTimeInSegment(long elapsedTime) {
+        this.elapsedTimeInSegment = elapsedTime;
+    }
+
+    public void setRepairEndTime(LocalDateTime repairEndTime) {
+        this.repairEndTime = repairEndTime;
     }
 
     public void setListoParaRegresarAlmacen(boolean listoParaRegresarAlmacen) {
@@ -90,19 +231,29 @@ public class Vehicle {
                 return;
         }
 
+        // Calcular el tiempo de finalización de la reparación basado en el tiempo de simulación
         LocalDateTime repairEndTime = currentTime.plusHours(repairHours);
+        this.setRepairEndTime(repairEndTime);
 
-        logger.info(String.format("Vehículo %s ha sufrido una avería tipo %s en %s. Estará detenido hasta %s",
-                this.getCode(), tipoAveria, this.getCurrentLocationUbigeo(), repairEndTime));
+        // Registrar el tramo actual y el tiempo transcurrido hasta la avería
+            if (this.route != null && this.currentSegmentIndex < this.route.size()) {
+            RouteSegment currentSegment = this.route.get(this.currentSegmentIndex);
+            long elapsedMinutes = ChronoUnit.MINUTES.between(this.status.getSegmentStartTime(), currentTime);
+            this.setElapsedTimeInSegment(elapsedMinutes);
 
-        // Programar la reparación
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-        executor.schedule(() -> {
-            this.estado = EstadoVehiculo.EN_ALMACEN; // Asumimos que vuelve al almacén después de la reparación
-            this.setAvailable(true);
-            logger.info(String.format("Vehículo %s ha sido reparado y está nuevamente disponible en el almacén", this.getCode()));
-            executor.shutdown();
-        }, repairHours, TimeUnit.HOURS);
+            String segmentLog = String.format("Vehículo %s ha sufrido una avería tipo %s en el tramo %d: %s. Tiempo transcurrido en el tramo: %d minutos.",
+                    this.getCode(), tipoAveria, this.currentSegmentIndex + 1, currentSegment.getName(), elapsedMinutes);
+            addBreakdownLog(this.getCode(), segmentLog);
+            logger.info(segmentLog);
+        }
+
+        // Iniciar el seguimiento del tiempo de avería
+        this.startAveria(currentTime);
+
+        String breakdownLog = String.format("Vehículo %s ha sufrido una avería tipo %s en %s. Estará detenido hasta %s.",
+                this.getCode(), tipoAveria, this.getCurrentLocationUbigeo(), repairEndTime);
+        addBreakdownLog(this.getCode(), breakdownLog);
+        logger.info(breakdownLog);
     }
 
     public Order getCurrentOrder() {
@@ -113,9 +264,6 @@ public class Vehicle {
         this.currentOrder = currentOrder;
     }
 
-    private Order currentOrder;
-    private List<RouteSegment> route;
-    private int currentSegmentIndex;
 
     // Constructor
     public Vehicle(String code, String type, int capacity, String currentLocationUbigeo) {
@@ -179,7 +327,7 @@ public class Vehicle {
 
     private boolean hasArrivedAtDestination(LocalDateTime currentTime) {
         return currentTime.isAfter(status.getEstimatedArrivalTime()) || currentTime.isEqual(status.getEstimatedArrivalTime());
-    }
+    } // estimatedDeliveryTime
 
     private void handleArrivalAtDestination(LocalDateTime currentTime, WarehouseManager warehouseManager) {
         currentSegmentIndex++;
@@ -355,6 +503,7 @@ public class Vehicle {
         }
 
         this.currentSegmentIndex = 0;
+        this.elapsedTimeInSegment = 0;
         this.status = new VehicleStatus();
         this.currentOrder = order;
         this.departureTime = startTime;
@@ -364,7 +513,8 @@ public class Vehicle {
         updateCurrentSegment(startTime);
 
         String startTimeStr = startTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        String estimatedArrivalStr = calculateEstimatedArrivalTime(startTime, this.route).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        estimatedDeliveryTime = calculateEstimatedArrivalTime(startTime, this.route);
+        String estimatedArrivalStr = estimatedDeliveryTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
         String dueTimeStr = order.getDueTime().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
 
         StringBuilder logBuilder = new StringBuilder();

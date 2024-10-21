@@ -65,7 +65,7 @@ public class Utils {
 
         // Convertimos el tiempo (en minutos) a horas y luego a distancia en km
         double distanceKm = (travelTime / 60.0) * averageSpeed;
-
+        // distancia = velocidad * tiempo
         return distanceKm;
     }
 

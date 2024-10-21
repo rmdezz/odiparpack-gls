@@ -36,6 +36,8 @@ public class SimulationState {
     private List<Maintenance> maintenanceSchedule;
     private static final String BREAKDOWN_COMMAND_FILE = "src/main/resources/breakdown_commands.txt";
     private long lastModified = 0;
+    // Mapa para almacenar los logs de avería por vehículo
+    public static final Map<String, List<String>> breakdownLogs = new HashMap<>();
 
     public List<Blockage> getActiveBlockages() {
         return activeBlockages;
@@ -74,6 +76,16 @@ public class SimulationState {
                 .toArray(long[][]::new);
         this.maintenanceSchedule = maintenanceSchedule;
         updateBlockages(initialSimulationTime, blockages);
+    }
+
+    // Getter para breakdownLogs
+    public Map<String, List<String>> getBreakdownLogs() {
+        return breakdownLogs;
+    }
+
+    // Método para agregar un mensaje de avería
+    public static void addBreakdownLog(String vehicleCode, String message) {
+        breakdownLogs.computeIfAbsent(vehicleCode, k -> new ArrayList<>()).add(message);
     }
 
     public WarehouseManager getWarehouseManager() {
@@ -122,29 +134,6 @@ public class SimulationState {
                 blockage.getEndTime());
     }
 
-    public void checkForBreakdownCommands() {
-        Path path = Paths.get(BREAKDOWN_COMMAND_FILE);
-        try {
-            long currentLastModified = Files.getLastModifiedTime(path).toMillis();
-            if (currentLastModified > lastModified) {
-                List<String> lines = Files.readAllLines(path);
-                for (String line : lines) {
-                    String[] parts = line.split(",");
-                    if (parts.length == 2) {
-                        String vehicleCode = parts[0].trim();
-                        String breakdownType = parts[1].trim();
-                        provocarAveria(vehicleCode, breakdownType);
-                    }
-                }
-                lastModified = currentLastModified;
-                // Limpiar el archivo después de leer
-                Files.write(path, new byte[0]);
-            }
-        } catch (IOException e) {
-            logger.warning("Error al leer el archivo de comandos de avería: " + e.getMessage());
-        }
-    }
-
     private void updateTimeMatrix() {
         logger.info("Actualizando matriz de tiempo basada en bloqueos activos");
 
@@ -171,40 +160,75 @@ public class SimulationState {
             List<Vehicle> vehiclesNeedingNewRoutes = new ArrayList<>();
 
             for (Vehicle vehicle : vehicles.values()) {
-                // Primero, verificar si el vehículo está saliendo de mantenimiento
-                if (vehicle.getEstado() == Vehicle.EstadoVehiculo.EN_MANTENIMIENTO) {
-                    checkAndUpdateMaintenanceStatus(vehicle);
+                if (vehicle.isInMaintenance()) {
+                    handleMaintenance(vehicle);
+                    continue;
                 }
 
-                // Verificar si el vehiculo esta programado para mantenimiento
-                Maintenance mantenimiento = getCurrentMaintenance(vehicle.getCode());
-                if (mantenimiento != null) {
-                    handleVehicleInMaintenance(vehicle, mantenimiento);
-                } else if (vehicle.getEstado() == Vehicle.EstadoVehiculo.EN_TRANSITO_ORDEN ||
-                        vehicle.getEstado() == Vehicle.EstadoVehiculo.HACIA_ALMACEN ||
-                        vehicle.getEstado() == Vehicle.EstadoVehiculo.EN_ESPERA_EN_OFICINA) {
-                    vehicle.updateStatus(currentTime, warehouseManager);
-                } else if (vehicle.getEstado() == Vehicle.EstadoVehiculo.LISTO_PARA_RETORNO && !vehicle.isRouteBeingCalculated()) {
-                    if (vehicle.getWaitStartTime() == null ||
-                            ChronoUnit.MINUTES.between(vehicle.getWaitStartTime(), currentTime) >= Vehicle.WAIT_TIME_MINUTES) {
-                        vehicle.setRouteBeingCalculated(true);
-                        vehiclesNeedingNewRoutes.add(vehicle);
-                    }
+                if (vehicle.isUnderRepair()) {
+                    handleRepairCompletion(vehicle, currentTime);
+                    vehicle.updateAveriaTime(currentTime);  // Actualizar el tiempo en estado de avería
+                }
+
+                if (vehicle.shouldUpdateStatus()) {
+                    handleVehicleStatusUpdate(vehicle, currentTime);
+                }
+
+                if (vehicle.shouldCalculateNewRoute(currentTime)) {
+                    vehiclesNeedingNewRoutes.add(vehicle);
                 }
             }
 
             if (!vehiclesNeedingNewRoutes.isEmpty()) {
-                logger.info("Vehículos que necesitan nuevas rutas: " + vehiclesNeedingNewRoutes.stream()
-                        .map(Vehicle::getCode)
-                        .collect(Collectors.joining(", ")));
-
-                // Ejecutar calculateNewRoutes en un hilo separado
-                new Thread(() -> calculateNewRoutes(vehiclesNeedingNewRoutes)).start();
+                logVehiclesNeedingNewRoutes(vehiclesNeedingNewRoutes);
+                processNewRoutes(vehiclesNeedingNewRoutes);
             }
 
         } finally {
             lock.unlock();
         }
+    }
+
+    private void handleMaintenance(Vehicle vehicle) {
+        Maintenance mantenimiento = getCurrentMaintenance(vehicle.getCode());
+        if (mantenimiento != null) {
+            handleVehicleInMaintenance(vehicle, mantenimiento);
+        }
+    }
+
+    private void handleRepairCompletion(Vehicle vehicle, LocalDateTime currentTime) {
+        if (vehicle.hasCompletedRepair(currentTime)) {
+            if (vehicle.getEstado() == Vehicle.EstadoVehiculo.AVERIADO_1) {
+                vehicle.continueCurrentRoute(currentTime);
+                logger.info(String.format("Vehículo %s ha sido reparado y continúa su ruta actual.", vehicle.getCode()));
+            } else {
+                vehicle.setEstado(Vehicle.EstadoVehiculo.EN_ALMACEN);
+                vehicle.setAvailable(true);
+                logger.info(String.format("Vehículo %s ha sido reparado y está nuevamente disponible en el almacén.", vehicle.getCode()));
+            }
+            vehicle.clearRepairTime();
+        }
+    }
+
+    private void handleVehicleStatusUpdate(Vehicle vehicle, LocalDateTime currentTime) {
+        vehicle.updateStatus(currentTime, warehouseManager);
+    }
+
+    private void collectVehiclesNeedingNewRoutes(Vehicle vehicle, List<Vehicle> vehiclesNeedingNewRoutes, LocalDateTime currentTime) {
+        if (vehicle.shouldCalculateNewRoute(currentTime)) {
+            vehiclesNeedingNewRoutes.add(vehicle);
+        }
+    }
+
+    private void logVehiclesNeedingNewRoutes(List<Vehicle> vehiclesNeedingNewRoutes) {
+        String vehicleCodes = vehiclesNeedingNewRoutes.stream()
+                .map(Vehicle::getCode)
+                .collect(Collectors.joining(", "));
+        logger.info("Vehículos que necesitan nuevas rutas: " + vehicleCodes);
+    }
+
+    private void processNewRoutes(List<Vehicle> vehiclesNeedingNewRoutes) {
+        new Thread(() -> calculateNewRoutes(vehiclesNeedingNewRoutes)).start();
     }
 
     private void checkAndUpdateMaintenanceStatus(Vehicle vehicle) {
@@ -243,6 +267,11 @@ public class SimulationState {
                 }
                 vehicle.handleBreakdown(currentTime, estadoAveria);
                 logger.info(String.format("Avería tipo %s provocada en el vehículo %s", breakdownType, vehicleCode));
+
+                // Agregar un mensaje de avería
+                String logMessage = String.format("Avería tipo %s provocada en el vehículo %s en %s.",
+                        breakdownType, vehicleCode, currentTime);
+                addBreakdownLog(vehicleCode, logMessage);
             } else {
                 logger.warning(String.format("No se puede provocar avería en el vehículo %s porque no está en tránsito", vehicleCode));
             }

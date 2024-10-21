@@ -1,18 +1,42 @@
 package com.odiparpack;
 
+import com.codahale.metrics.ConsoleReporter;
+import com.codahale.metrics.Meter;
+import com.codahale.metrics.MetricRegistry;
 import com.google.ortools.Loader;
 import com.google.ortools.constraintsolver.*;
 import com.odiparpack.models.*;
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.lang.management.ManagementFactory;
+import com.sun.management.OperatingSystemMXBean;
+
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.text.DecimalFormat;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import com.google.protobuf.Duration;
-
+import org.jfree.chart.ChartFactory;
+import org.jfree.chart.ChartUtils;
+import org.jfree.chart.JFreeChart;
+import org.jfree.data.time.Millisecond;
+import org.jfree.data.time.TimeSeries;
+import org.jfree.data.time.TimeSeriesCollection;
 import static com.odiparpack.Utils.*;
+import java.io.File;
+import java.io.IOException;
+import java.util.stream.Stream;
 
 public class Main {
     public static final Logger logger = Logger.getLogger(Main.class.getName());
@@ -29,7 +53,37 @@ public class Main {
     public static List<String> locationUbigeos;
     public static Map<String, Location> locations;
 
-    public static void main(String[] args) {
+    // Variable global para almacenar el tiempo total de entrega de todos los pedidos
+    private static long totalDeliveryTime = 0;
+
+    static class Metrics {
+        private int iteracion;
+        private long tiempoEjecucionMs;
+        private long tiempoEntregaMin;
+        private double consumoMemoriaMb;
+        private double consumoCpuPorcentaje;
+
+        public Metrics(int iteracion, long tiempoEjecucionMs, long tiempoEntregaMin, double consumoMemoriaMb, double consumoCpuPorcentaje) {
+            this.iteracion = iteracion;
+            this.tiempoEjecucionMs = tiempoEjecucionMs;
+            this.tiempoEntregaMin = tiempoEntregaMin;
+            this.consumoMemoriaMb = consumoMemoriaMb;
+            this.consumoCpuPorcentaje = consumoCpuPorcentaje;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("%d\t%d\t%d\t%.2f\t%.2f",
+                    iteracion,
+                    tiempoEjecucionMs,
+                    tiempoEntregaMin,
+                    consumoMemoriaMb,
+                    consumoCpuPorcentaje);
+        }
+    }
+
+
+    public static void main(String[] args) throws IOException {
         Loader.loadNativeLibraries();
 
         DataLoader dataLoader = new DataLoader();
@@ -59,30 +113,157 @@ public class Main {
             locationUbigeos.add(loc.getUbigeo());
         }
 
+        List<Metrics> allMetrics = new ArrayList<>();
+        int subset = 40;
+
+        // Buscar archivos con el formato execution_metrics_subset_x_iter_y.txt y resource_usage_subset_x_iter_y.txt
+        List<Path> executionFiles = findFilesByPattern("execution_metrics_subset_" + subset + "_iter_\\d+\\.txt");
+        List<Path> resourceFiles = findFilesByPattern("resource_usage_subset_" + subset + "_iter_\\d+\\.txt");
+
+        System.out.println("Archivos de ejecución encontrados: " + executionFiles.size());
+        System.out.println("Archivos de recursos encontrados: " + resourceFiles.size());
+
+        // Mapear archivos por número de iteración
+        Map<Integer, Path> executionMap = mapFilesByIteration(executionFiles);
+        Map<Integer, Path> resourceMap = mapFilesByIteration(resourceFiles);
+
+        // Obtener el conjunto de iteraciones presentes en ambos mapas
+        Set<Integer> iteraciones = new TreeSet<>(executionMap.keySet());
+        iteraciones.retainAll(resourceMap.keySet());
+
+        System.out.println("Número de iteraciones emparejadas: " + iteraciones.size());
+
+        // Procesar cada iteración emparejada
+        for (Integer iter : iteraciones) {
+            Path executionFile = executionMap.get(iter);
+            Path resourceFile = resourceMap.get(iter);
+
+            Metrics metrics = extractMetrics(executionFile, resourceFile);
+            if (metrics != null) {
+                allMetrics.add(metrics);
+            }
+        }
+
+        // Mostrar los resultados en formato tabla
+        System.out.println("# Iteracion\tTiempo de ejecucion (ms)\tTiempo total de entrega (min)\tConsumo de memoria promedio (MB)\tConsumo de CPU promedio (%)");
+        for (Metrics metrics : allMetrics) {
+            System.out.println(metrics);
+        }
+
+        // iter: 6 problema con 30 ped
+        // iter: 14 se cae tmb con 30
+
+        // iter: 10, 23 se cae con ped40
+        //executeForEachSubset(orders, vehicles, 30, 40, 24);
+
         /*LocalDateTime currentTime = LocalDateTime.now();
-        List<Order> availableOrders = orders;
+        List<Order> availableOrders = orders; // tomamos todos los pedidos ignorando el tiempo en el que apareceran
         if (!availableOrders.isEmpty()) {
             logger.info("Órdenes disponibles: " + availableOrders.size());
             List<VehicleAssignment> assignments = assignOrdersToVehicles(availableOrders, vehicles, currentTime);
-            if (!assignments.isEmpty()) {
-                DataModel data = new DataModel(timeMatrix, assignments, locationIndices, locationNames, locationUbigeos);
 
-                logger.info("Tiempo de LIMA a CHURCAMPA: " + data.timeMatrix[data.starts[0]][data.ends[0]]);
-                logger.info("Tiempo de TRUJILLO a BONGARA: " + data.timeMatrix[data.starts[1]][data.ends[1]]);
+            Map<String, VehicleAssignment> uniqueDestinationMap = new HashMap<>();
+            for (VehicleAssignment assignment : assignments) {
+                String destination = assignment.getOrder().getDestinationUbigeo();
+                uniqueDestinationMap.putIfAbsent(destination, assignment);
+            }
 
-                printRelevantTimeMatrix(data, "130101", "010301"); // TRUJILLO a BONGARA
+            // Convertir el mapa filtrado a una lista
+            List<VehicleAssignment> filteredAssignments = new ArrayList<>(uniqueDestinationMap.values());
+
+            // Crea una instancia del monitor
+            ResourceMonitor monitor = new ResourceMonitor();
+            long durationInMillis = 0;
+
+            try {
+                // Inicia el monitoreo
+                monitor.startMonitoring();
+
+                // Tomar el tiempo inicial antes de iniciar la resolución
+                long startTime = System.nanoTime();
+
+                // Resolver el conjunto completo de asignaciones
+                DataModel data = new DataModel(timeMatrix, new ArrayList<>(), filteredAssignments, locationIndices, locationNames, locationUbigeos);
+                RoutingIndexManager manager = createRoutingIndexManager(data, data.starts, data.ends);
+                RoutingModel routing = createRoutingModel(manager, data);
+                RoutingSearchParameters searchParameters = createSearchParameters();
+
+                logger.info("Iniciando la resolución del modelo de rutas para el conjunto completo.");
+                Assignment solution = routing.solveWithParameters(searchParameters);
+
+                if (solution != null) {
+                    logger.info("Solución encontrada para el conjunto completo.");
+                    printSolution(data, routing, manager, solution);
+                    logger.info("Rutas calculadas.");
+                } else {
+                    logger.info("No se encontró solución para el conjunto completo. Iniciando la división del conjunto...");
+
+                    // Definir las estrategias a intentar en orden
+                    List<FirstSolutionStrategy.Value> strategies = Arrays.asList(
+                            FirstSolutionStrategy.Value.CHRISTOFIDES,
+                            FirstSolutionStrategy.Value.PATH_CHEAPEST_ARC
+                    );
+                    List<SolutionData> solutions = Collections.synchronizedList(new ArrayList<>());
+                    divideAndSolve(assignments, strategies, solutions); // Llamada recursiva si falla la resolución completa
+
+                    // Después de que todas las computaciones hayan finalizado, imprimimos las soluciones
+                    for (SolutionData solutionData : solutions) {
+                        logger.info("SOLUCION ASDASD");
+                        printSolutionData(solutionData);
+                    }
+                }
+
+                // Tomar el tiempo final después de completar todo
+                long endTime = System.nanoTime();
+
+                // Calcular el tiempo transcurrido en milisegundos
+                durationInMillis = (endTime - startTime) / 1_000_000;
+
+                logger.info("Tiempo transcurrido en resolver las rutas: " + durationInMillis + " ms");
+
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                // Detiene el monitoreo
+                monitor.stopMonitoring();
+            }
+
+            // Después de que el monitoreo ha terminado, genera las gráficas
+            generateGraphs(monitor);
+            // Imprimir el tiempo total de entrega acumulado
+            logger.info("Tiempo total de entrega acumulado: " + totalDeliveryTime + " minutos.");
+
+            // Guardar las métricas de ejecución en un archivo txt
+            saveExecutionMetrics(totalDeliveryTime, durationInMillis);
+        }*/
+
+
+
+           /* if (!assignments.isEmpty()) {
+                DataModel data = new DataModel(timeMatrix, new ArrayList<>(), filteredAssignments, locationIndices, locationNames, locationUbigeos);
 
                 logger.info("Calculando rutas para asignaciones...");
-                calculateRoute(data, data.starts, data.ends);
-                logger.info("Rutas calculadas.");
+                RoutingIndexManager manager = createRoutingIndexManager(data, data.starts, data.ends);
+                RoutingModel routing = createRoutingModel(manager, data);
+                RoutingSearchParameters searchParameters = createSearchParameters();
+
+                logger.info("Iniciando la resolución del modelo de rutas para rutas faltantes.");
+                Assignment solution = routing.solveWithParameters(searchParameters);
+                logger.info("Solución de rutas obtenida para rutas faltantes.");
+                if (solution != null) {
+                    printSolution(data, routing, manager, solution);
+                    logger.info("Rutas calculadas.");
+                } else {
+                    logger.info("No se encontró solución..");
+                }
             }
         } else {
             logger.info("No hay órdenes disponibles en este momento.");
         }*/
 
-        // Iniciar simulación
+        /*// Iniciar simulación
         runSimulation(timeMatrix, orders, vehicles, locationIndices, locationNames, locationUbigeos, locations, routeCache,
-                blockages, maintenanceSchedule);
+                blockages, maintenanceSchedule);*/
 
         /*// Calcular la ruta de ida
         logger.info("Calculando ruta de ida (Almacén -> Destino Final):");
@@ -96,6 +277,719 @@ public class Main {
         OdiparPackSolver solver = new OdiparPackSolver(locations, orders, vehicles, edges, blockages, maintenances);
         solver.runSimulation();*/
     }
+
+    // Función para encontrar archivos por patrón
+    private static List<Path> findFilesByPattern(String pattern) throws IOException {
+        Path dir = Paths.get("."); // Directorio actual
+        System.out.println("Buscando en el directorio: " + dir.toAbsolutePath().toString()); // Imprimir el directorio de búsqueda
+        Pattern regex = Pattern.compile(pattern);
+
+        // Buscar archivos en el directorio especificado que coincidan con el patrón
+        try (Stream<Path> stream = Files.walk(dir)) {
+            return stream.filter(file -> !Files.isDirectory(file) && regex.matcher(file.getFileName().toString()).matches())
+                    .collect(Collectors.toList());
+        }
+    }
+
+    // Función para mapear archivos por número de iteración
+    private static Map<Integer, Path> mapFilesByIteration(List<Path> files) {
+        Map<Integer, Path> fileMap = new HashMap<>();
+        for (Path file : files) {
+            int iter = extractIterationFromFilename(file.getFileName().toString());
+            if (iter != -1) {
+                fileMap.put(iter, file);
+            }
+        }
+        return fileMap;
+    }
+
+    // Función para extraer el número de iteración del nombre de archivo
+    private static int extractIterationFromFilename(String filename) {
+        Pattern pattern = Pattern.compile("iter_(\\d+)(?=\\D|$)");
+        Matcher matcher = pattern.matcher(filename);
+        if (matcher.find()) {
+            return Integer.parseInt(matcher.group(1));
+        }
+        return -1;
+    }
+
+    // Función para extraer métricas de los archivos
+    private static Metrics extractMetrics(Path executionFile, Path resourceFile) {
+        int iteracion = extractIterationFromFilename(executionFile.getFileName().toString());
+
+        long tiempoEntregaMin = 0;
+        long tiempoEjecucionMs = 0;
+        double consumoMemoriaMb = 0;
+        double consumoCpuPorcentaje = 0;
+
+        try {
+            // Leer el archivo execution_metrics
+            List<String> executionLines = Files.readAllLines(executionFile);
+            for (String line : executionLines) {
+                if (line.contains("Tiempo total de entrega acumulado:")) {
+                    tiempoEntregaMin = Long.parseLong(line.replaceAll("[^0-9]", "").trim());
+                } else if (line.contains("Tiempo transcurrido en resolver las rutas:")) {
+                    tiempoEjecucionMs = Long.parseLong(line.replaceAll("[^0-9]", "").trim());
+                }
+            }
+
+            // Leer el archivo resource_usage
+            List<String> resourceLines = Files.readAllLines(resourceFile);
+            Pattern cpuPattern = Pattern.compile("Media de Uso de CPU:\\s+([0-9.]+)");
+            Pattern memoryPattern = Pattern.compile("Media de Uso de Memoria:\\s+([0-9.]+)");
+
+            for (String line : resourceLines) {
+                Matcher cpuMatcher = cpuPattern.matcher(line);
+                Matcher memoryMatcher = memoryPattern.matcher(line);
+
+                if (cpuMatcher.find()) {
+                    consumoCpuPorcentaje = Double.parseDouble(cpuMatcher.group(1)); // Extraer el valor numérico de la CPU
+                }
+                if (memoryMatcher.find()) {
+                    consumoMemoriaMb = Double.parseDouble(memoryMatcher.group(1)); // Extraer el valor numérico de la memoria
+                }
+            }
+
+            return new Metrics(iteracion, tiempoEjecucionMs, tiempoEntregaMin, consumoMemoriaMb, consumoCpuPorcentaje);
+
+        } catch (IOException e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+
+    /**
+     * Ejecuta el procesamiento de pedidos en subconjuntos, permitiendo iniciar desde una iteración específica
+     * y registrando los rangos de pedidos procesados.
+     *
+     * @param orders        Lista completa de pedidos a procesar.
+     * @param vehicles      Lista de vehículos disponibles para asignación.
+     * @param iterations    Número total de iteraciones a ejecutar.
+     * @param subsetSize    Tamaño de cada subconjunto de pedidos por iteración.
+     * @param startIteration Iteración desde la cual comenzar (0-based). Si es 0, comienza desde la primera iteración.
+     */
+    public static void executeForEachSubset(List<Order> orders, List<Vehicle> vehicles, int iterations, int subsetSize, int startIteration) {
+        // Validar los parámetros de entrada
+        if (orders == null || vehicles == null) {
+            throw new IllegalArgumentException("Las listas de pedidos y vehículos no pueden ser nulas.");
+        }
+        if (subsetSize <= 0) {
+            throw new IllegalArgumentException("El tamaño del subconjunto debe ser mayor que 0.");
+        }
+        if (iterations <= 0) {
+            throw new IllegalArgumentException("El número de iteraciones debe ser mayor que 0.");
+        }
+
+        // Validar y ajustar el índice de inicio
+        if (startIteration < 0 || startIteration >= iterations) {
+            logger.warning("startIteration (" + startIteration + ") está fuera de rango. Comenzando desde la primera iteración (0).");
+            startIteration = 0;
+        }
+
+        logger.info("Comenzando el procesamiento desde la iteración " + (startIteration + 1));
+
+        for (int iter = startIteration; iter < iterations; iter++) {
+            // Calcular los índices de inicio y fin para el subconjunto actual
+            int start = iter * subsetSize;
+            int end = Math.min(start + subsetSize, orders.size());
+            List<Order> availableOrdersSubset = orders.subList(start, end);
+
+            LocalDateTime currentTime = LocalDateTime.now();
+            if (!availableOrdersSubset.isEmpty()) {
+                logger.info("Iteración " + (iter + 1) + ": Procesando órdenes desde índice " + start + " hasta " + (end - 1) + " (Total: " + availableOrdersSubset.size() + ")");
+
+                // Resetear estado de los vehículos
+                resetVehicleStates(vehicles);
+
+                // Asignar órdenes a vehículos
+                List<VehicleAssignment> assignments = assignOrdersToVehicles(availableOrdersSubset, vehicles, currentTime);
+
+                // Filtrar asignaciones por destino único
+                List<VehicleAssignment> filteredAssignments = filterUniqueDestinations(assignments);
+
+                // Crear una instancia del monitor
+                ResourceMonitor monitor = new ResourceMonitor();
+                long durationInMillis = 0;
+                totalDeliveryTime = 0;
+
+                try {
+                    // Iniciar el monitoreo de recursos
+                    monitor.startMonitoring();
+
+                    // Tomar el tiempo inicial antes de iniciar la resolución
+                    long startTime = System.nanoTime();
+
+                    // Crear el modelo de datos para OR-Tools
+                    DataModel data = new DataModel(timeMatrix, new ArrayList<>(), filteredAssignments, locationIndices, locationNames, locationUbigeos);
+                    RoutingIndexManager manager = createRoutingIndexManager(data, data.starts, data.ends);
+                    RoutingModel routing = createRoutingModel(manager, data);
+                    RoutingModel alternativeRouting = null;
+                    boolean usedAlternativeStrategy = false;
+
+                    // Intentar resolver con la estrategia CHRISTOFIDES
+                    RoutingSearchParameters searchParameters = createSearchParameters(FirstSolutionStrategy.Value.CHRISTOFIDES);
+                    logger.info("Resolviendo con estrategia CHRISTOFIDES.");
+                    logger.info("Iniciando la resolución del modelo de rutas para el conjunto completo.");
+                    Assignment solution = routing.solveWithParameters(searchParameters);
+
+                    // Si no se encuentra solución, reintentar con PATH_CHEAPEST_ARC
+                    if (solution == null) {
+                        logger.info("No se encontró solución con CHRISTOFIDES. Reintentando con PATH_CHEAPEST_ARC.");
+                        RoutingSearchParameters alternativeSearchParameters = createSearchParameters(FirstSolutionStrategy.Value.PATH_CHEAPEST_ARC);
+                        alternativeRouting = createRoutingModel(manager, data);
+                        solution = alternativeRouting.solveWithParameters(alternativeSearchParameters);
+                        usedAlternativeStrategy = true;
+                    }
+
+                    if (solution != null) {
+                        if (usedAlternativeStrategy) {
+                            routing = alternativeRouting;
+                        }
+                        logger.info("Solución encontrada para el conjunto completo.");
+                        printSolution(data, routing, manager, solution);
+                        logger.info("Rutas calculadas.");
+                    } else {
+                        logger.info("No se encontró solución para el conjunto completo. Iniciando la división del conjunto...");
+                        // Definir las estrategias a intentar en orden
+                        List<FirstSolutionStrategy.Value> strategies = Arrays.asList(
+                                FirstSolutionStrategy.Value.CHRISTOFIDES,
+                                FirstSolutionStrategy.Value.PATH_CHEAPEST_ARC
+                        );
+                        List<SolutionData> solutions = Collections.synchronizedList(new ArrayList<>());
+                        divideAndSolve(filteredAssignments, strategies, solutions); // Llamada recursiva si falla la resolución completa
+
+                        for (SolutionData solutionData : solutions) {
+                            logger.info("Solución encontrada en subconjunto.");
+                            printSolutionData(solutionData);
+                        }
+                    }
+
+                    // Tomar el tiempo final después de completar todo
+                    long endTime = System.nanoTime();
+
+                    // Calcular el tiempo transcurrido en milisegundos
+                    durationInMillis = (endTime - startTime) / 1_000_000;
+
+                    logger.info("Tiempo transcurrido en resolver las rutas: " + durationInMillis + " ms");
+
+                } catch (Exception e) {
+                    logger.log(Level.SEVERE, "Error en la iteración " + (iter + 1), e);
+                } finally {
+                    // Detener el monitoreo de recursos
+                    monitor.stopMonitoring();
+                }
+
+                // Guardar las gráficas y el uso de recursos (puedes habilitar o deshabilitar las imágenes)
+                generateGraphsForIteration(monitor, subsetSize, iter + 1, false);
+
+                // Guardar las métricas de ejecución en un archivo txt
+                saveExecutionMetricsForIteration((long) totalDeliveryTime, durationInMillis, subsetSize, iter + 1);
+
+                // Imprimir el tiempo total de entrega acumulado (asegúrate de que esta variable se actualice correctamente)
+                logger.info("Tiempo total de entrega acumulado: " + totalDeliveryTime + " minutos.");
+            } else {
+                logger.info("No hay órdenes disponibles en este momento para la iteración " + (iter + 1) + ".");
+            }
+        }
+    }
+
+        /**
+         * Resetea el estado de todos los vehículos a 'EN_ALMACEN' y los marca como disponibles.
+         *
+         * @param vehicles Lista de vehículos a resetear.
+         */
+        private static void resetVehicleStates(List<Vehicle> vehicles) {
+            for (Vehicle vehicle : vehicles) {
+                vehicle.setEstado(Vehicle.EstadoVehiculo.EN_ALMACEN);
+                vehicle.setAvailable(true);
+            }
+            logger.info("Estados de vehículos reseteados.");
+        }
+
+        /**
+         * Filtra las asignaciones para asegurar que cada destino sea único.
+         *
+         * @param assignments Lista de asignaciones de vehículos.
+         * @return Lista filtrada de asignaciones con destinos únicos.
+         */
+        private static List<VehicleAssignment> filterUniqueDestinations(List<VehicleAssignment> assignments) {
+            Map<String, VehicleAssignment> uniqueDestinationMap = new HashMap<>();
+            for (VehicleAssignment assignment : assignments) {
+                String destination = assignment.getOrder().getDestinationUbigeo();
+                uniqueDestinationMap.putIfAbsent(destination, assignment);
+            }
+            return new ArrayList<>(uniqueDestinationMap.values());
+        }
+
+    public static void generateGraphsForIteration(ResourceMonitor monitor, int subsetSize, int iteration, boolean generateImages) {
+        // Obtiene los datos del monitor
+        List<Long> timestamps = monitor.getTimestamps();
+        List<Double> cpuUsages = monitor.getCpuUsages();
+        List<Long> memoryUsages = monitor.getMemoryUsages();
+
+        // Calcular el total para calcular el promedio luego
+        double totalCpuUsage = 0;
+        long totalMemoryUsage = 0;
+
+        for (int i = 0; i < timestamps.size(); i++) {
+            totalCpuUsage += cpuUsages.get(i);
+            totalMemoryUsage += memoryUsages.get(i);
+        }
+
+        // Si se desea generar imágenes
+        if (generateImages) {
+            // Genera la gráfica de CPU
+            TimeSeries cpuSeries = new TimeSeries("CPU Usage");
+            for (int i = 0; i < timestamps.size(); i++) {
+                cpuSeries.addOrUpdate(new Millisecond(new Date(timestamps.get(i))), cpuUsages.get(i));
+            }
+            TimeSeriesCollection cpuDataset = new TimeSeriesCollection(cpuSeries);
+            JFreeChart cpuChart = ChartFactory.createTimeSeriesChart(
+                    "Consumo de CPU",
+                    "Tiempo",
+                    "Uso de CPU (%)",
+                    cpuDataset,
+                    false,
+                    false,
+                    false
+            );
+
+            // Guarda la gráfica de CPU como imagen
+            try {
+                ChartUtils.saveChartAsPNG(new File("cpu_usage_subset_" + subsetSize + "_iter_" + iteration + ".png"), cpuChart, 800, 600);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            // Genera la gráfica de Memoria
+            TimeSeries memorySeries = new TimeSeries("Memory Usage");
+            for (int i = 0; i < timestamps.size(); i++) {
+                memorySeries.addOrUpdate(new Millisecond(new Date(timestamps.get(i))), memoryUsages.get(i));
+            }
+            TimeSeriesCollection memoryDataset = new TimeSeriesCollection(memorySeries);
+            JFreeChart memoryChart = ChartFactory.createTimeSeriesChart(
+                    "Consumo de Memoria",
+                    "Tiempo",
+                    "Uso de Memoria (MB)",
+                    memoryDataset,
+                    false,
+                    false,
+                    false
+            );
+
+            // Guarda la gráfica de Memoria como imagen
+            try {
+                ChartUtils.saveChartAsPNG(new File("memory_usage_subset_" + subsetSize + "_iter_" + iteration + ".png"), memoryChart, 800, 600);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+        // Calcular las medias
+        double averageCpuUsage = totalCpuUsage / cpuUsages.size();
+        double averageMemoryUsage = (double) totalMemoryUsage / memoryUsages.size();
+
+        // Formato de decimales para las medias
+        DecimalFormat df = new DecimalFormat("#.##");
+
+        // Crear un archivo .txt con los datos y las medias
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter("resource_usage_subset_" + subsetSize + "_iter_" + iteration + ".txt"))) {
+            writer.write("Timestamp (ms), CPU Usage (%), Memory Usage (MB)\n");
+            for (int i = 0; i < timestamps.size(); i++) {
+                writer.write(timestamps.get(i) + ", " + cpuUsages.get(i) + ", " + memoryUsages.get(i) + "\n");
+            }
+            writer.write("\n--- Estadísticas Finales ---\n");
+            writer.write("Media de Uso de CPU: " + df.format(averageCpuUsage) + " %\n");
+            writer.write("Media de Uso de Memoria: " + df.format(averageMemoryUsage) + " MB\n");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static void saveExecutionMetricsForIteration(long totalDeliveryTime, long durationInMillis, int subsetSize, int iteration) {
+        // Crear un archivo .txt con los tiempos y el total de entrega acumulado
+        String fileName = "execution_metrics_subset_" + subsetSize + "_iter_" + iteration + ".txt";
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(fileName, true))) {
+            writer.write("--- Métricas de Ejecución ---\n");
+            writer.write("Tiempo total de entrega acumulado: " + totalDeliveryTime + " minutos\n");
+            writer.write("Tiempo transcurrido en resolver las rutas: " + durationInMillis + " ms\n");
+            writer.write("\n");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        System.out.println("Archivo de métricas de ejecución guardado exitosamente.");
+    }
+
+
+
+    public static void saveExecutionMetrics(long totalDeliveryTime, long durationInMillis) {
+        // Crear un archivo .txt con los tiempos y el total de entrega acumulado
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter("execution_metrics.txt", true))) {
+            writer.write("--- Métricas de Ejecución ---\n");
+            writer.write("Tiempo total de entrega acumulado: " + totalDeliveryTime + " minutos\n");
+            writer.write("Tiempo transcurrido en resolver las rutas: " + durationInMillis + " ms\n");
+            writer.write("\n");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        System.out.println("Archivo de métricas de ejecución guardado exitosamente.");
+    }
+
+    public static void generateGraphs(ResourceMonitor monitor) {
+        // Obtiene los datos del monitor
+        List<Long> timestamps = monitor.getTimestamps();
+        List<Double> cpuUsages = monitor.getCpuUsages();
+        List<Long> memoryUsages = monitor.getMemoryUsages();
+
+        // Inicializa acumuladores para calcular la media
+        double totalCpuUsage = 0;
+        long totalMemoryUsage = 0;
+
+        // Genera la gráfica de CPU
+        TimeSeries cpuSeries = new TimeSeries("CPU Usage");
+        for (int i = 0; i < timestamps.size(); i++) {
+            cpuSeries.addOrUpdate(new Millisecond(new Date(timestamps.get(i))), cpuUsages.get(i));
+            totalCpuUsage += cpuUsages.get(i);  // Suma para calcular la media
+        }
+        TimeSeriesCollection cpuDataset = new TimeSeriesCollection(cpuSeries);
+        JFreeChart cpuChart = ChartFactory.createTimeSeriesChart(
+                "Consumo de CPU",
+                "Tiempo",
+                "Uso de CPU (%)",
+                cpuDataset,
+                false,
+                false,
+                false
+        );
+
+        // Guarda la gráfica de CPU como imagen
+        try {
+            ChartUtils.saveChartAsPNG(new File("cpu_usage.png"), cpuChart, 800, 600);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        // Genera la gráfica de Memoria
+        TimeSeries memorySeries = new TimeSeries("Memory Usage");
+        for (int i = 0; i < timestamps.size(); i++) {
+            memorySeries.addOrUpdate(new Millisecond(new Date(timestamps.get(i))), memoryUsages.get(i));
+            totalMemoryUsage += memoryUsages.get(i);  // Suma para calcular la media
+        }
+        TimeSeriesCollection memoryDataset = new TimeSeriesCollection(memorySeries);
+        JFreeChart memoryChart = ChartFactory.createTimeSeriesChart(
+                "Consumo de Memoria",
+                "Tiempo",
+                "Uso de Memoria (MB)",
+                memoryDataset,
+                false,
+                false,
+                false
+        );
+
+        // Guarda la gráfica de Memoria como imagen
+        try {
+            ChartUtils.saveChartAsPNG(new File("memory_usage.png"), memoryChart, 800, 600);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        // Calcular las medias
+        double averageCpuUsage = totalCpuUsage / cpuUsages.size();
+        double averageMemoryUsage = (double) totalMemoryUsage / memoryUsages.size();
+
+        // Formato de decimales para las medias
+        DecimalFormat df = new DecimalFormat("#.##");
+
+        // Crear un archivo .txt con los datos y las medias
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter("resource_usage.txt"))) {
+            writer.write("Timestamp (ms), CPU Usage (%), Memory Usage (MB)\n");
+            for (int i = 0; i < timestamps.size(); i++) {
+                writer.write(timestamps.get(i) + ", " + cpuUsages.get(i) + ", " + memoryUsages.get(i) + "\n");
+            }
+            writer.write("\n--- Estadísticas Finales ---\n");
+            writer.write("Media de Uso de CPU: " + df.format(averageCpuUsage) + " %\n");
+            writer.write("Media de Uso de Memoria: " + df.format(averageMemoryUsage) + " MB\n");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        System.out.println("Gráficas y archivo de datos generados exitosamente.");
+    }
+
+    private static long getProcessCpuLoad() {
+        OperatingSystemMXBean osBean = ManagementFactory.getPlatformMXBean(OperatingSystemMXBean.class);
+        return (long) (osBean.getProcessCpuLoad() * 100); // Porcentaje de CPU usado
+    }
+
+    private static long getUsedMemory() {
+        Runtime runtime = Runtime.getRuntime();
+        return (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024); // Memoria usada en MB
+    }
+
+    /**
+     * Método optimizado para dividir y resolver las asignaciones de vehículos.
+     */
+    public static void divideAndSolve(List<VehicleAssignment> assignments,
+                                      List<FirstSolutionStrategy.Value> strategies,
+                                      List<SolutionData> solutions) {
+        if (assignments == null || strategies == null || solutions == null) {
+            throw new IllegalArgumentException("Los argumentos no pueden ser nulos.");
+        }
+
+        // Utilizar una colección thread-safe para almacenar las soluciones
+        List<SolutionData> threadSafeSolutions = Collections.synchronizedList(solutions);
+
+        // Crear un ExecutorService con un número de hilos fijo
+        ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        int maxDepth = 10;
+        try {
+            // Iniciar el procesamiento del conjunto completo
+            Future<?> future = executor.submit(() ->
+                    processSubset(assignments, strategies, threadSafeSolutions, executor, 0, maxDepth)
+            );
+
+            // Esperar a que todas las tareas se completen
+            future.get();
+
+        } catch (InterruptedException | ExecutionException e) {
+            logger.log(Level.SEVERE, "Error en la ejecución del proceso de resolución.", e);
+        } finally {
+            // Apagar el ExecutorService de manera ordenada
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    /**
+     * Método auxiliar para procesar un subconjunto de asignaciones.
+     * Intenta resolver el subconjunto con las estrategias proporcionadas.
+     * Si no se puede resolver, divide el subconjunto y procesa recursivamente.
+     *
+     * @param subset        El subconjunto de asignaciones a procesar.
+     * @param strategies    La lista de estrategias a intentar.
+     * @param solutions     La lista thread-safe donde se almacenarán las soluciones.
+     * @param executor      El ExecutorService para manejar tareas concurrentes.
+     */
+    private static void processSubset(List<VehicleAssignment> subset,
+                                      List<FirstSolutionStrategy.Value> strategies,
+                                      List<SolutionData> solutions,
+                                      ExecutorService executor,
+                                      int depth,
+                                      int maxDepth) {
+        if (depth > maxDepth) {
+            logger.warning("Profundidad máxima alcanzada. Deteniendo la división de subconjuntos.");
+            return;
+        }
+
+        if (subset.size() <= 1) {
+            logger.info("No se puede dividir más. Pedido conflictivo detectado.");
+            return;
+        }
+
+        // Iterar sobre las estrategias en orden
+        for (FirstSolutionStrategy.Value strategy : strategies) {
+            logger.info("Intentando resolver subconjunto con estrategia: " + strategy);
+
+            // Intentar resolver el subconjunto con la estrategia actual
+            RoutingResult result = solveSubset(subset, strategy);
+
+            if (result != null && result.solution != null) {
+                logger.info("Solución encontrada para el subconjunto con estrategia: " + strategy);
+
+                // Extraer y agregar la solución
+                SolutionData solutionData = extractSolutionData(result.data, result.routingModel, result.manager, result.solution);
+                solutions.add(solutionData);
+
+                // Estrategia exitosa, no es necesario probar más estrategias para este subconjunto
+                return;
+            } else {
+                logger.info("No se encontró solución para el subconjunto con estrategia: " + strategy);
+            }
+        }
+
+        // Si ninguna estrategia resolvió el subconjunto, dividirlo nuevamente
+        logger.info("Todas las estrategias fallaron para el subconjunto. Dividiendo nuevamente...");
+
+        int mid = subset.size() / 2;
+        List<VehicleAssignment> firstHalf = new ArrayList<>(subset.subList(0, mid));
+        List<VehicleAssignment> secondHalf = new ArrayList<>(subset.subList(mid, subset.size()));
+
+        // Procesar cada mitad de manera concurrente
+        Future<?> futureFirst = executor.submit(() ->
+                processSubset(firstHalf, strategies, solutions, executor, depth + 1, maxDepth)
+        );
+
+        Future<?> futureSecond = executor.submit(() ->
+                processSubset(secondHalf, strategies, solutions, executor, depth + 1, maxDepth)
+        );
+
+        try {
+            // Esperar a que ambas mitades se procesen
+            futureFirst.get();
+            futureSecond.get();
+        } catch (InterruptedException | ExecutionException e) {
+            logger.log(Level.SEVERE, "Error al procesar los subconjuntos divididos.", e);
+        }
+    }
+
+    /**
+     * Método auxiliar para resolver un subconjunto con una estrategia específica.
+     *
+     * @param subset   El subconjunto de asignaciones a resolver.
+     * @param strategy La estrategia a aplicar.
+     * @return El resultado de la resolución, o null si no se encontró solución.
+     */
+    private static RoutingResult solveSubset(List<VehicleAssignment> subset, FirstSolutionStrategy.Value strategy) {
+        try {
+            DataModel data = new DataModel(timeMatrix, new ArrayList<>(), subset, locationIndices, locationNames, locationUbigeos);
+            RoutingIndexManager manager = createRoutingIndexManager(data, data.starts, data.ends);
+            RoutingModel routing = createRoutingModel(manager, data);
+            RoutingSearchParameters searchParameters = createSearchParameters(strategy);
+
+            Assignment solution = routing.solveWithParameters(searchParameters);
+
+            if (solution != null) {
+                logger.info("Solución encontrada para el subconjunto con estrategia: " + strategy);
+                return new RoutingResult(solution, routing, manager, data);
+            } else {
+                logger.info("No se encontró solución para el subconjunto con estrategia: " + strategy);
+                return null;
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error al resolver el subconjunto con estrategia: " + strategy, e);
+            return null;
+        }
+    }
+
+
+    // Método para extraer los datos de la solución en una estructura Java pura
+    private static SolutionData extractSolutionData(DataModel data,
+                                                    RoutingModel routing,
+                                                    RoutingIndexManager manager,
+                                                    Assignment solution) {
+        SolutionData solutionData = new SolutionData();
+        solutionData.objectiveValue = solution.objectiveValue();
+        solutionData.routes = new HashMap<>();
+        long maxRouteTime = 0;  // Variable para almacenar el tiempo máximo entre todas las rutas
+        long localTotalTime = 0;  // Variable local para almacenar el tiempo total de esta solución
+
+        for (int i = 0; i < data.vehicleNumber; ++i) {
+            String vehicleCode = "Vehículo_" + i; // Puedes adaptar para obtener el código del vehículo real si está disponible
+            List<RouteSegment> route = new ArrayList<>();
+            long routeTime = 0;  // Variable para almacenar el tiempo total de la ruta actual
+
+            long index = routing.start(i);
+            while (!routing.isEnd(index)) {
+                long nextIndex = solution.value(routing.nextVar(index));
+                int fromNode = manager.indexToNode(index);
+                int toNode = manager.indexToNode(nextIndex);
+
+                String fromName = data.locationNames.get(fromNode);
+                String fromUbigeo = data.locationUbigeos.get(fromNode);
+                String toName = data.locationNames.get(toNode);
+                String toUbigeo = data.locationUbigeos.get(toNode);
+
+                long durationMinutes = data.timeMatrix[fromNode][toNode];
+                double distance = calculateDistanceFromNodes(data, fromNode, toNode);
+
+                // Agregar el tiempo de viaje al total de la ruta
+                routeTime += durationMinutes;
+
+                // Agregar el segmento de ruta a la lista
+                route.add(new RouteSegment(fromName + " to " + toName, toUbigeo, distance, durationMinutes));
+
+                // Avanzar al siguiente nodo
+                index = nextIndex;
+            }
+
+            // Almacenar la ruta calculada para el vehículo actual
+            solutionData.routes.put(vehicleCode, route);
+
+            // Guardar el tiempo total de la ruta
+            solutionData.routeTimes.put(vehicleCode, routeTime);
+
+            // Comparar para obtener el máximo tiempo entre todas las rutas
+            maxRouteTime = Math.max(maxRouteTime, routeTime);
+
+            // Sumar el tiempo total de esta ruta al tiempo local total de la solución
+            localTotalTime += routeTime;
+        }
+
+        // Almacenar el tiempo máximo de todas las rutas en la solución
+        solutionData.maxRouteTime = maxRouteTime;
+
+        // Sumar el tiempo local total de esta solución al contador global
+        synchronized (Main.class) {
+            totalDeliveryTime += localTotalTime;
+        }
+
+        return solutionData;
+    }
+
+
+    // Estructura para almacenar los datos de la solución
+    static class SolutionData {
+        public long objectiveValue;
+        public Map<String, List<RouteSegment>> routes; // Mapa de rutas por vehículo
+        public Map<String, Long> routeTimes;            // Mapa para almacenar el tiempo total de cada ruta
+        public long maxRouteTime;
+
+        public SolutionData() {
+            this.routes = new HashMap<>();
+            this.routeTimes = new HashMap<>();
+            this.maxRouteTime = 0;
+        }
+    }
+
+    // Método para imprimir los datos de la solución almacenados
+    private static void printSolutionData(SolutionData solutionData) {
+        logger.info("Objetivo de la Solución: " + solutionData.objectiveValue);
+
+        long maxRouteTime = solutionData.maxRouteTime; // Recuperamos el tiempo máximo almacenado
+        long localTotalTime = 0;  // Variable local para almacenar el tiempo total de esta solución
+
+        for (Map.Entry<String, List<RouteSegment>> entry : solutionData.routes.entrySet()) {
+            String vehicleCode = entry.getKey();
+            List<RouteSegment> routeSegments = entry.getValue();
+
+            logger.info("\n--- Ruta para el " + vehicleCode + " ---");
+
+            // Variable para acumular el tiempo total de la ruta
+            long routeTime = solutionData.routeTimes.get(vehicleCode);
+
+            // Imprimir los segmentos de la ruta
+            int routeStep = 1;
+            for (RouteSegment segment : routeSegments) {
+                logger.info(String.format(
+                        "%d. De %s: Duración %d minutos, Distancia %.2f km",
+                        routeStep,
+                        segment.getName(),
+                        segment.getDurationMinutes(),
+                        segment.getDistance()
+                ));
+                routeStep++;
+            }
+
+            // Imprimir el tiempo total de la ruta
+            logger.info("Tiempo total de la ruta: " + formatTime(routeTime));
+            localTotalTime += routeTime;
+        }
+
+        totalDeliveryTime += localTotalTime;
+
+        // Imprimir el tiempo máximo entre todas las rutas
+        logger.info("Máximo tiempo de las rutas: " + formatTime(maxRouteTime));
+    }
+
 
     private static void printRelevantTimeMatrix(DataModel data, String origin, String destination) {
         int originIndex = data.locationUbigeos.indexOf(origin);
@@ -159,11 +1053,15 @@ public class Main {
         LocalDateTime endTime = state.getCurrentTime().plusDays(SIMULATION_DAYS);
         AtomicBoolean isSimulationRunning = new AtomicBoolean(true);
 
+        // Iniciar el servidor de averías
+        BreakdownServer breakdownServer = new BreakdownServer(state);
+        breakdownServer.start();
+
         scheduleTimeAdvancement(state, endTime, isSimulationRunning, vehicleRoutes, executorService, blockages);
         schedulePlanning(state, allOrders, locationIndices, locationNames, locationUbigeos, vehicleRoutes, executorService, isSimulationRunning);
 
         while (isSimulationRunning.get()) {
-            state.checkForBreakdownCommands();
+            //state.checkForBreakdownCommands();
             Thread.sleep(1000);
         }
     }
@@ -339,7 +1237,9 @@ public class Main {
             List<RouteSegment> route = allRoutes.get(vehicle.getCode());
             if (route != null) {
                 vehicle.setRoute(route);
-                vehicle.startJourney(state.getCurrentTime(), assignment.getOrder());
+                if (state != null) {
+                    vehicle.startJourney(state.getCurrentTime(), assignment.getOrder());
+                }
                 logger.info("Vehículo " + vehicle.getCode() + " iniciando viaje a " + assignment.getOrder().getDestinationUbigeo());
             } else {
                 logger.warning("No se encontró ruta para el vehículo " + vehicle.getCode());
@@ -375,7 +1275,9 @@ public class Main {
                 continue; // No hay paquetes por asignar
             }
 
-            List<Vehicle> availableVehicles = getAvailableVehicles(vehicles, order.getOriginUbigeo());
+            List<Vehicle> availableVehicles = getAvailableVehicles(vehicles, order.getOriginUbigeo()).stream()
+                    .sorted(Comparator.comparingInt(Vehicle::getCapacity).reversed()) // Ordenar por capacidad descendente
+                    .collect(Collectors.toList());
 
             if (availableVehicles.isEmpty()) {
                 logger.info("No hay vehículos disponibles en " + order.getOriginUbigeo() + " para la orden " + order.getId());
@@ -714,11 +1616,24 @@ public class Main {
     public static RoutingSearchParameters createSearchParameters() {
         RoutingSearchParameters searchParameters = main.defaultRoutingSearchParameters()
                 .toBuilder()
-                .setFirstSolutionStrategy(FirstSolutionStrategy.Value.PATH_CHEAPEST_ARC)
+                .setFirstSolutionStrategy(FirstSolutionStrategy.Value.CHRISTOFIDES)
                 .setLocalSearchMetaheuristic(LocalSearchMetaheuristic.Value.GUIDED_LOCAL_SEARCH)
                 .setTimeLimit(Duration.newBuilder().setSeconds(10).build())
+                //.setLogSearch(true)  // Habilitar "verbose logging"
                 .build();
         logger.info("Parámetros de búsqueda configurados.");
+        return searchParameters;
+    }
+
+    public static RoutingSearchParameters createSearchParameters(FirstSolutionStrategy.Value firstSolutionStrategy) {
+        RoutingSearchParameters searchParameters = main.defaultRoutingSearchParameters()
+                .toBuilder()
+                .setFirstSolutionStrategy(firstSolutionStrategy)
+                .setLocalSearchMetaheuristic(LocalSearchMetaheuristic.Value.GUIDED_LOCAL_SEARCH)
+                .setTimeLimit(Duration.newBuilder().setSeconds(10).build())
+                //.setLogSearch(true)  // Habilitar "verbose logging"
+                .build();
+        logger.info("Parámetros de búsqueda configurados con estrategia: " + firstSolutionStrategy);
         return searchParameters;
     }
 
@@ -780,6 +1695,8 @@ public class Main {
 
         // Inspeccionar la solución.
         long maxRouteTime = 0;
+        long localTotalTime = 0;  // Variable local para almacenar el tiempo total de esta solución
+
         for (int i = 0; i < data.vehicleNumber; ++i) {
             long index = routing.start(i);
             logger.info("\n--- Ruta para el Vehículo " + i + " ---");
@@ -832,8 +1749,10 @@ public class Main {
             logger.info(routeBuilder.toString());
             logger.info("Tiempo total de la ruta: " + formatTime(routeTime));
             maxRouteTime = Math.max(routeTime, maxRouteTime);
+            localTotalTime += routeTime;
         }
         logger.info("Máximo tiempo de las rutas: " + formatTime(maxRouteTime));
+        totalDeliveryTime = localTotalTime;
     }
 
 }
