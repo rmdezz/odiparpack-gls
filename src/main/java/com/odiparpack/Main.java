@@ -10,6 +10,12 @@ import com.odiparpack.models.*;
 import java.io.BufferedWriter;
 import java.io.FileWriter;
 import java.lang.management.ManagementFactory;
+
+import com.odiparpack.services.DataService;
+import com.odiparpack.simulation.SimulationEngine;
+import com.odiparpack.simulation.state.SimulationComponents;
+import com.odiparpack.simulation.state.SimulationInitializer;
+import com.odiparpack.simulation.state.SimulationState;
 import com.sun.management.OperatingSystemMXBean;
 
 import java.nio.file.DirectoryStream;
@@ -43,10 +49,10 @@ public class Main {
     private static final int SIMULATION_DAYS = 7;
     private static final int SIMULATION_SPEED = 10; // 1 minuto de simulación = 1 segundo de tiempo real
     private static final int PLANNING_INTERVAL_MINUTES = 15;
-    private static final int ROUTE_CACHE_CAPACITY = 1000;
+    public static final int ROUTE_CACHE_CAPACITY = 1000;
     private static final int TIME_ADVANCEMENT_INTERVAL_MINUTES = 5; // New variable for time advancement interval
 
-    private static RouteCache routeCache;
+    public static RouteCache routeCache;
     public static Map<String, Integer> locationIndices;
     public static long[][] timeMatrix;
     public static List<String> locationNames;
@@ -82,6 +88,22 @@ public class Main {
         }
     }
 
+    /*public static void main(String[] args) {
+        // Cargar las librerías nativas requeridas por OR-Tools
+        Loader.loadNativeLibraries();
+
+        // Crear e inicializar el estado de la simulación con todos los componentes
+        SimulationState simulationState = new SimulationState();
+
+        // Crear la instancia del motor de simulación
+        SimulationEngine simulationEngine = new SimulationEngine(simulationState);
+
+        // Iniciar el controlador de la simulación (servidor web) para manejar las APIs REST y comunicaciones WebSocket
+        com.odiparpack.SimulationController simulationController = new com.odiparpack.SimulationController(simulationState, simulationEngine);
+        simulationController.start();
+
+        // El método main termina aquí
+    }*/
 
     public static void main(String[] args) throws IOException {
         Loader.loadNativeLibraries();
@@ -98,184 +120,51 @@ public class Main {
 
         routeCache = new RouteCache(ROUTE_CACHE_CAPACITY);
 
+        // Construir índices y matrices
         List<Location> locationList = new ArrayList<>(locations.values());
+
+        // Inicializar índices de ubicación globalmente
         locationIndices = new HashMap<>();
         for (int i = 0; i < locationList.size(); i++) {
             locationIndices.put(locationList.get(i).getUbigeo(), i);
         }
 
-        timeMatrix = dataLoader.createTimeMatrix(locationList, edges);
+        long[][] timeMatrix = dataLoader.createTimeMatrix(locationList, edges);
 
-        locationNames = new ArrayList<>();
-        locationUbigeos = new ArrayList<>();
+        List<String> locationNames = new ArrayList<>();
+        List<String> locationUbigeos = new ArrayList<>();
         for (Location loc : locationList) {
             locationNames.add(loc.getProvince());
             locationUbigeos.add(loc.getUbigeo());
         }
 
-        List<Metrics> allMetrics = new ArrayList<>();
-        int subset = 40;
+        // Inicializar SimulationState con los datos necesarios
+        Map<String, Vehicle> vehicleMap = vehicles.stream().collect(Collectors.toMap(Vehicle::getCode, v -> v));
+        LocalDateTime initialSimulationTime = orders.stream()
+                .map(Order::getOrderTime)
+                .min(LocalDateTime::compareTo)
+                .orElse(LocalDateTime.now())
+                .withHour(0).withMinute(0).withSecond(0).withNano(0);
 
-        // Buscar archivos con el formato execution_metrics_subset_x_iter_y.txt y resource_usage_subset_x_iter_y.txt
-        List<Path> executionFiles = findFilesByPattern("execution_metrics_subset_" + subset + "_iter_\\d+\\.txt");
-        List<Path> resourceFiles = findFilesByPattern("resource_usage_subset_" + subset + "_iter_\\d+\\.txt");
+        com.odiparpack.models.SimulationState simulationState = new com.odiparpack.models.SimulationState(
+                vehicleMap,
+                initialSimulationTime,
+                orders,
+                locations,
+                routeCache,
+                timeMatrix,
+                blockages,
+                maintenanceSchedule,
+                locationIndices,
+                locationNames,
+                locationUbigeos
+        );
 
-        System.out.println("Archivos de ejecución encontrados: " + executionFiles.size());
-        System.out.println("Archivos de recursos encontrados: " + resourceFiles.size());
+        // Iniciar el servidor SimulationController
+        SimulationController simulationController = new SimulationController(simulationState);
+        simulationController.start();
 
-        // Mapear archivos por número de iteración
-        Map<Integer, Path> executionMap = mapFilesByIteration(executionFiles);
-        Map<Integer, Path> resourceMap = mapFilesByIteration(resourceFiles);
-
-        // Obtener el conjunto de iteraciones presentes en ambos mapas
-        Set<Integer> iteraciones = new TreeSet<>(executionMap.keySet());
-        iteraciones.retainAll(resourceMap.keySet());
-
-        System.out.println("Número de iteraciones emparejadas: " + iteraciones.size());
-
-        // Procesar cada iteración emparejada
-        for (Integer iter : iteraciones) {
-            Path executionFile = executionMap.get(iter);
-            Path resourceFile = resourceMap.get(iter);
-
-            Metrics metrics = extractMetrics(executionFile, resourceFile);
-            if (metrics != null) {
-                allMetrics.add(metrics);
-            }
-        }
-
-        // Mostrar los resultados en formato tabla
-        System.out.println("# Iteracion\tTiempo de ejecucion (ms)\tTiempo total de entrega (min)\tConsumo de memoria promedio (MB)\tConsumo de CPU promedio (%)");
-        for (Metrics metrics : allMetrics) {
-            System.out.println(metrics);
-        }
-
-        // iter: 6 problema con 30 ped
-        // iter: 14 se cae tmb con 30
-
-        // iter: 10, 23 se cae con ped40
-        //executeForEachSubset(orders, vehicles, 30, 40, 24);
-
-        /*LocalDateTime currentTime = LocalDateTime.now();
-        List<Order> availableOrders = orders; // tomamos todos los pedidos ignorando el tiempo en el que apareceran
-        if (!availableOrders.isEmpty()) {
-            logger.info("Órdenes disponibles: " + availableOrders.size());
-            List<VehicleAssignment> assignments = assignOrdersToVehicles(availableOrders, vehicles, currentTime);
-
-            Map<String, VehicleAssignment> uniqueDestinationMap = new HashMap<>();
-            for (VehicleAssignment assignment : assignments) {
-                String destination = assignment.getOrder().getDestinationUbigeo();
-                uniqueDestinationMap.putIfAbsent(destination, assignment);
-            }
-
-            // Convertir el mapa filtrado a una lista
-            List<VehicleAssignment> filteredAssignments = new ArrayList<>(uniqueDestinationMap.values());
-
-            // Crea una instancia del monitor
-            ResourceMonitor monitor = new ResourceMonitor();
-            long durationInMillis = 0;
-
-            try {
-                // Inicia el monitoreo
-                monitor.startMonitoring();
-
-                // Tomar el tiempo inicial antes de iniciar la resolución
-                long startTime = System.nanoTime();
-
-                // Resolver el conjunto completo de asignaciones
-                DataModel data = new DataModel(timeMatrix, new ArrayList<>(), filteredAssignments, locationIndices, locationNames, locationUbigeos);
-                RoutingIndexManager manager = createRoutingIndexManager(data, data.starts, data.ends);
-                RoutingModel routing = createRoutingModel(manager, data);
-                RoutingSearchParameters searchParameters = createSearchParameters();
-
-                logger.info("Iniciando la resolución del modelo de rutas para el conjunto completo.");
-                Assignment solution = routing.solveWithParameters(searchParameters);
-
-                if (solution != null) {
-                    logger.info("Solución encontrada para el conjunto completo.");
-                    printSolution(data, routing, manager, solution);
-                    logger.info("Rutas calculadas.");
-                } else {
-                    logger.info("No se encontró solución para el conjunto completo. Iniciando la división del conjunto...");
-
-                    // Definir las estrategias a intentar en orden
-                    List<FirstSolutionStrategy.Value> strategies = Arrays.asList(
-                            FirstSolutionStrategy.Value.CHRISTOFIDES,
-                            FirstSolutionStrategy.Value.PATH_CHEAPEST_ARC
-                    );
-                    List<SolutionData> solutions = Collections.synchronizedList(new ArrayList<>());
-                    divideAndSolve(assignments, strategies, solutions); // Llamada recursiva si falla la resolución completa
-
-                    // Después de que todas las computaciones hayan finalizado, imprimimos las soluciones
-                    for (SolutionData solutionData : solutions) {
-                        logger.info("SOLUCION ASDASD");
-                        printSolutionData(solutionData);
-                    }
-                }
-
-                // Tomar el tiempo final después de completar todo
-                long endTime = System.nanoTime();
-
-                // Calcular el tiempo transcurrido en milisegundos
-                durationInMillis = (endTime - startTime) / 1_000_000;
-
-                logger.info("Tiempo transcurrido en resolver las rutas: " + durationInMillis + " ms");
-
-            } catch (Exception e) {
-                e.printStackTrace();
-            } finally {
-                // Detiene el monitoreo
-                monitor.stopMonitoring();
-            }
-
-            // Después de que el monitoreo ha terminado, genera las gráficas
-            generateGraphs(monitor);
-            // Imprimir el tiempo total de entrega acumulado
-            logger.info("Tiempo total de entrega acumulado: " + totalDeliveryTime + " minutos.");
-
-            // Guardar las métricas de ejecución en un archivo txt
-            saveExecutionMetrics(totalDeliveryTime, durationInMillis);
-        }*/
-
-
-
-           /* if (!assignments.isEmpty()) {
-                DataModel data = new DataModel(timeMatrix, new ArrayList<>(), filteredAssignments, locationIndices, locationNames, locationUbigeos);
-
-                logger.info("Calculando rutas para asignaciones...");
-                RoutingIndexManager manager = createRoutingIndexManager(data, data.starts, data.ends);
-                RoutingModel routing = createRoutingModel(manager, data);
-                RoutingSearchParameters searchParameters = createSearchParameters();
-
-                logger.info("Iniciando la resolución del modelo de rutas para rutas faltantes.");
-                Assignment solution = routing.solveWithParameters(searchParameters);
-                logger.info("Solución de rutas obtenida para rutas faltantes.");
-                if (solution != null) {
-                    printSolution(data, routing, manager, solution);
-                    logger.info("Rutas calculadas.");
-                } else {
-                    logger.info("No se encontró solución..");
-                }
-            }
-        } else {
-            logger.info("No hay órdenes disponibles en este momento.");
-        }*/
-
-        /*// Iniciar simulación
-        runSimulation(timeMatrix, orders, vehicles, locationIndices, locationNames, locationUbigeos, locations, routeCache,
-                blockages, maintenanceSchedule);*/
-
-        /*// Calcular la ruta de ida
-        logger.info("Calculando ruta de ida (Almacén -> Destino Final):");
-        calculateRoute(data, data.starts, data.ends);*/
-
-        /*List<Order> orders = dataLoader.loadOrders("src/main/resources/orders.txt", locations);
-        List<Blockage> blockages = dataLoader.loadBlockages("src/main/resources/blockages.txt");
-        List<Maintenance> maintenances = dataLoader.loadMaintenanceSchedule("src/main/resources/maintenance.txt");
-
-        // Crear instancia del solver y resolver
-        OdiparPackSolver solver = new OdiparPackSolver(locations, orders, vehicles, edges, blockages, maintenances);
-        solver.runSimulation();*/
+        // El método main termina aquí
     }
 
     // Función para encontrar archivos por patrón
@@ -905,7 +794,7 @@ public class Main {
                 routeTime += durationMinutes;
 
                 // Agregar el segmento de ruta a la lista
-                route.add(new RouteSegment(fromName + " to " + toName, toUbigeo, distance, durationMinutes));
+                route.add(new RouteSegment(fromName + " to " + toName, fromUbigeo, toUbigeo, distance, durationMinutes));
 
                 // Avanzar al siguiente nodo
                 index = nextIndex;
@@ -1003,7 +892,7 @@ public class Main {
         }
     }
 
-    private static void runSimulation(long[][] timeMatrix, List<Order> allOrders, List<Vehicle> vehicles,
+    /*private static void runSimulation(long[][] timeMatrix, List<Order> allOrders, List<Vehicle> vehicles,
                                       Map<String, Integer> locationIndices, List<String> locationNames,
                                       List<String> locationUbigeos, Map<String, Location> locations,
                                       RouteCache routeCache, List<Blockage> blockages, List<Maintenance> maintenanceSchedule) {
@@ -1019,15 +908,15 @@ public class Main {
         } finally {
             shutdownExecutors(executorService);
         }
-    }
+    }*/
 
-    private static SimulationState initializeSimulation(List<Order> allOrders, List<Vehicle> vehicles, Map<String,
+    /*private static SimulationState initializeSimulation(List<Order> allOrders, List<Vehicle> vehicles, Map<String,
             Location> locations, RouteCache routeCache, long[][] timeMatrix, List<Blockage> blockages, List<Maintenance> maintenanceSchedule) {
         LocalDateTime initialSimulationTime = determineInitialSimulationTime(allOrders);
         Map<String, Vehicle> vehicleMap = createVehicleMap(vehicles);
         return new SimulationState(vehicleMap, initialSimulationTime, allOrders, locations, routeCache,
                 timeMatrix, blockages, maintenanceSchedule);
-    }
+    }*/
 
     private static LocalDateTime determineInitialSimulationTime(List<Order> allOrders) {
         return allOrders.stream()
@@ -1045,7 +934,7 @@ public class Main {
         return Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors() + 2);
     }
 
-    private static void runSimulationLoop(SimulationState state, long[][] timeMatrix, List<Order> allOrders,
+    /*private static void runSimulationLoop(SimulationState state, long[][] timeMatrix, List<Order> allOrders,
                                           Map<String, Integer> locationIndices, List<String> locationNames,
                                           List<String> locationUbigeos, Map<String, List<RouteSegment>> vehicleRoutes,
                                           ScheduledExecutorService executorService,
@@ -1064,9 +953,9 @@ public class Main {
             //state.checkForBreakdownCommands();
             Thread.sleep(1000);
         }
-    }
+    }*/
 
-    private static void scheduleTimeAdvancement(SimulationState state, LocalDateTime endTime, AtomicBoolean isSimulationRunning,
+    /*private static void scheduleTimeAdvancement(SimulationState state, LocalDateTime endTime, AtomicBoolean isSimulationRunning,
                                                 Map<String, List<RouteSegment>> vehicleRoutes,
                                                 ScheduledExecutorService executorService, List<Blockage> allBlockages) {
         executorService.scheduleAtFixedRate(() -> {
@@ -1077,7 +966,7 @@ public class Main {
                 logger.info("Tiempo de simulación: " + state.getCurrentTime());
 
                 state.updateBlockages(state.getCurrentTime(), allBlockages);
-                state.updateVehicleStates(vehicleRoutes);
+                state.updateVehicleStates();
                 state.updateOrderStatuses();
                 logger.info("Estados de vehículos, pedidos y bloqueos actualizados.");
 
@@ -1089,9 +978,9 @@ public class Main {
                 logger.log(Level.SEVERE, "Error en la tarea de avance del tiempo", e);
             }
         }, 0, TIME_ADVANCEMENT_INTERVAL_MINUTES * 1000L / SIMULATION_SPEED, TimeUnit.MILLISECONDS);
-    }
+    }*/
 
-    private static void schedulePlanning(SimulationState state, List<Order> allOrders,
+    /*private static void schedulePlanning(SimulationState state, List<Order> allOrders,
                                          Map<String, Integer> locationIndices, List<String> locationNames,
                                          List<String> locationUbigeos, Map<String, List<RouteSegment>> vehicleRoutes,
                                          ScheduledExecutorService executorService, AtomicBoolean isSimulationRunning) {
@@ -1116,7 +1005,7 @@ public class Main {
                 logger.log(Level.SEVERE, "Error en el ciclo de planificación", e);
             }
         }, 0, PLANNING_INTERVAL_MINUTES * 1000L / SIMULATION_SPEED, TimeUnit.MILLISECONDS);
-    }
+    }*/
 
     private static void logAvailableOrders(List<Order> availableOrders) {
         logger.info("Órdenes disponibles: " + availableOrders.size());
@@ -1125,7 +1014,7 @@ public class Main {
         }
     }
 
-    private static void calculateAndApplyRoutes(long[][] currentTimeMatrix, List<VehicleAssignment> assignments,
+    /*private static void calculateAndApplyRoutes(long[][] currentTimeMatrix, List<VehicleAssignment> assignments,
                                                 Map<String, Integer> locationIndices, List<String> locationNames,
                                                 List<String> locationUbigeos, Map<String, List<RouteSegment>> vehicleRoutes,
                                                 SimulationState state, ExecutorService executorService) {
@@ -1139,7 +1028,7 @@ public class Main {
                 logger.log(Level.SEVERE, "Error durante el cálculo de rutas", e);
             }
         });
-    }
+    }*/
 
     private static void shutdownExecutors(ExecutorService executorService) {
         executorService.shutdownNow();
@@ -1176,7 +1065,7 @@ public class Main {
                 long duration = data.timeMatrix[fromNode][toNode];
                 double distance = calculateDistanceFromNodes(data, fromNode, toNode);
 
-                route.add(new RouteSegment(fromName + " to " + toName, toUbigeo, distance, duration));
+                route.add(new RouteSegment(fromName + " to " + toName, fromUbigeo, toUbigeo, distance, duration));
 
                 index = nextIndex;
             }
@@ -1212,7 +1101,7 @@ public class Main {
                 long durationMinutes = data.timeMatrix[fromNode][toNode];
                 double distance = calculateDistanceFromNodes(data, fromNode, toNode);
 
-                route.add(new RouteSegment(fromName + " to " + toName, toUbigeo, distance, durationMinutes));
+                route.add(new RouteSegment(fromName + " to " + toName, fromUbigeo, toUbigeo, distance, durationMinutes));
 
                 index = nextIndex;
             }

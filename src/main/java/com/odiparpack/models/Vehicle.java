@@ -1,6 +1,8 @@
 package com.odiparpack.models;
 
 import com.odiparpack.DataLoader;
+import com.odiparpack.Main;
+import com.odiparpack.services.LocationService;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -8,16 +10,51 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-
 import static com.odiparpack.DataLoader.getUbigeoFromName;
 import static com.odiparpack.Main.locations;
 import static com.odiparpack.Main.logger;
 import static com.odiparpack.models.SimulationState.addBreakdownLog;
 
 public class Vehicle {
+    public void handleRepairCompletion(LocalDateTime currentTime) {
+        if (this.repairEndTime != null && !currentTime.isBefore(this.repairEndTime)) {
+            if (this.estado == EstadoVehiculo.AVERIADO_1) {
+                this.continueCurrentRoute(currentTime);
+                logger.info(String.format("Vehículo %s ha sido reparado y continúa su ruta actual.", this.getCode()));
+            } else {
+                this.setEstado(EstadoVehiculo.EN_ALMACEN);
+                this.setAvailable(true);
+                logger.info(String.format("Vehículo %s ha sido reparado y está nuevamente disponible en el almacén.", this.getCode()));
+            }
+            this.clearRepairTime();
+        }
+    }
+    public void updateBreakdownTime(LocalDateTime currentTime) {
+        // Verificar si el vehículo está en estado de avería y si hay un tiempo de inicio de la avería registrado
+        if (this.averiaStartTime != null) {
+            // Calcular el tiempo transcurrido desde el inicio de la avería hasta el currentTime
+            long minutesSinceAveriaStart = ChronoUnit.MINUTES.between(this.averiaStartTime, currentTime);
+
+            // Actualizar el tiempo total de avería
+            this.totalAveriaTime += minutesSinceAveriaStart;
+
+            // Reiniciar el tiempo de inicio de avería para evitar acumulación incorrecta en futuras llamadas
+            this.averiaStartTime = currentTime;
+
+            // Log de la actualización del tiempo de avería
+            logger.info(String.format("Vehículo %s ha acumulado %d minutos en estado de avería. Tiempo total acumulado: %d minutos.",
+                    this.getCode(), minutesSinceAveriaStart, this.totalAveriaTime));
+        } else {
+            logger.warning(String.format("Vehículo %s no tiene un tiempo de inicio de avería registrado.", this.getCode()));
+        }
+    }
+
+
+
     public enum EstadoVehiculo {
         HACIA_ALMACEN,
         EN_ALMACEN,
@@ -47,6 +84,128 @@ public class Vehicle {
     LocalDateTime estimatedDeliveryTime;
     private long totalAveriaTime; // Tiempo total en estado de avería (en minutos)
     private LocalDateTime averiaStartTime; // Tiempo de inicio de la avería
+    // Hora de inicio del viaje
+    private LocalDateTime journeyStartTime;
+    private List<PositionTimestamp> positionHistory = new ArrayList<>();
+
+    // Clase interna para almacenar posición y tiempo
+    public static class PositionTimestamp {
+        private LocalDateTime timestamp;
+        private Position position;
+
+        public PositionTimestamp(LocalDateTime timestamp, Position position) {
+            this.timestamp = timestamp;
+            this.position = position;
+        }
+
+        public LocalDateTime getTimestamp() { return timestamp; }
+        public Position getPosition() { return position; }
+    }
+
+    // Método para agregar una posición al historial
+    public void addPositionToHistory(LocalDateTime timestamp, Position position) {
+        positionHistory.add(new PositionTimestamp(timestamp, position));
+    }
+
+    // Getter para el historial de posiciones
+    public List<PositionTimestamp> getPositionHistory() {
+        return positionHistory;
+    }
+
+    // Método para obtener la posición actual del vehículo
+    /*public Position getCurrentPosition(LocalDateTime simulationTime, Map<String, Location> locations) {
+        if (route == null || route.isEmpty() || journeyStartTime == null) {
+            // El vehículo está estacionario en su ubicación actual
+            Location loc = locations.get(currentLocationUbigeo);
+            return new Position(loc.getLatitude(), loc.getLongitude());
+        }
+
+        // Calcular el tiempo transcurrido desde el inicio del viaje en minutos
+        long minutesSinceStart = ChronoUnit.MINUTES.between(journeyStartTime, simulationTime);
+
+        long accumulatedTime = 0;
+        for (RouteSegment segment : route) {
+            accumulatedTime += segment.getDurationMinutes();
+            if (minutesSinceStart <= accumulatedTime) {
+                // El vehículo está dentro de este segmento
+                long timeInSegment = segment.getDurationMinutes() - (accumulatedTime - minutesSinceStart);
+                double progress = (double) timeInSegment / segment.getDurationMinutes();
+
+                // Obtener las coordenadas de las ubicaciones de inicio y fin directamente por ubigeo
+                String fromUbigeo = segment.getFromUbigeo();
+                String toUbigeo = segment.getToUbigeo();
+
+                Location fromLocation = locations.get(fromUbigeo);
+                Location toLocation = locations.get(toUbigeo);
+
+                if (fromLocation == null || toLocation == null) {
+                    logger.warning("No se encontró ubicación para los ubigeos: " + fromUbigeo + ", " + toUbigeo);
+                    return null;
+                }
+
+                // Interpolar la posición
+                double lat = fromLocation.getLatitude() + (toLocation.getLatitude() - fromLocation.getLatitude()) * progress;
+                double lon = fromLocation.getLongitude() + (toLocation.getLongitude() - fromLocation.getLongitude()) * progress;
+
+                return new Position(lat, lon);
+            }
+        }
+
+        // Si el viaje está completo, el vehículo está en la última ubicación
+        Location loc = locations.get(getCurrentLocationUbigeo());
+        return new Position(loc.getLatitude(), loc.getLongitude());
+    }*/
+    public Position getCurrentPosition(LocalDateTime simulationTime) {
+        LocationService locationService = LocationService.getInstance();
+
+        if (route == null || route.isEmpty() || journeyStartTime == null) {
+            Location loc = locationService.getLocation(currentLocationUbigeo);
+            if (loc == null) {
+                logger.warning("No se encontró ubicación para el ubigeo: " + currentLocationUbigeo);
+                return null;
+            }
+            return new Position(loc.getLatitude(), loc.getLongitude());
+        }
+
+        long minutesSinceStart = ChronoUnit.MINUTES.between(journeyStartTime, simulationTime);
+        long accumulatedTime = 0;
+
+        for (RouteSegment segment : route) {
+            accumulatedTime += segment.getDurationMinutes();
+            if (minutesSinceStart <= accumulatedTime) {
+                long timeInSegment = segment.getDurationMinutes() - (accumulatedTime - minutesSinceStart);
+                double progress = (double) timeInSegment / segment.getDurationMinutes();
+
+                Location fromLocation = locationService.getLocation(segment.getFromUbigeo());
+                Location toLocation = locationService.getLocation(segment.getToUbigeo());
+
+                if (fromLocation == null || toLocation == null) {
+                    logger.warning("No se encontró ubicación para los ubigeos: " + segment.getFromUbigeo() + ", " + segment.getToUbigeo());
+                    return null;
+                }
+
+                double lat = fromLocation.getLatitude() + (toLocation.getLatitude() - fromLocation.getLatitude()) * progress;
+                double lon = fromLocation.getLongitude() + (toLocation.getLongitude() - fromLocation.getLongitude()) * progress;
+
+                return new Position(lat, lon);
+            }
+        }
+
+        Location loc = locationService.getLocation(getCurrentLocationUbigeo());
+        if (loc == null) {
+            logger.warning("No se encontró ubicación para el ubigeo: " + currentLocationUbigeo);
+            return null;
+        }
+        return new Position(loc.getLatitude(), loc.getLongitude());
+    }
+
+    private String getUbigeoByName(String name, Map<String, Location> locations) {
+        return locations.values().stream()
+                .filter(loc -> loc.getProvince().equals(name))
+                .map(Location::getUbigeo)
+                .findFirst()
+                .orElse(null);
+    }
 
     public long getTotalAveriaTime() {
         return totalAveriaTime;
@@ -295,6 +454,11 @@ public class Vehicle {
             return;
         }
 
+        // Calcular la posición actual
+        Position currentPosition = getCurrentPosition(currentTime);
+        // Agregar la posición al historial
+        addPositionToHistory(currentTime, currentPosition);
+
         if (status == null) { // || currentOrder == null
             return;
         }
@@ -501,7 +665,7 @@ public class Vehicle {
             logger.warning(String.format("Intento de iniciar un viaje para el vehículo %s con una ruta vacía.", this.getCode()));
             return;
         }
-
+        this.journeyStartTime = startTime;
         this.currentSegmentIndex = 0;
         this.elapsedTimeInSegment = 0;
         this.status = new VehicleStatus();
@@ -541,6 +705,7 @@ public class Vehicle {
             return;
         }
 
+        this.journeyStartTime = startTime; // Inicializar journeyStartTime
         this.currentSegmentIndex = 0;
         this.status = new VehicleStatus();
         this.currentOrder = null; // No hay orden activa en este viaje
@@ -569,7 +734,7 @@ public class Vehicle {
     private void updateCurrentSegment(LocalDateTime currentTime) {
         RouteSegment segment = route.get(currentSegmentIndex);
         status.setCurrentSegment(segment.getName());
-        status.setCurrentSegmentUbigeo(segment.getUbigeo());
+        status.setCurrentSegmentUbigeo(segment.getToUbigeo());
         status.setSegmentStartTime(currentTime);
         status.setEstimatedArrivalTime(currentTime.plusMinutes(segment.getDurationMinutes()));
         status.setCurrentSpeed(segment.getDistance() / (segment.getDurationMinutes() / 60.0));

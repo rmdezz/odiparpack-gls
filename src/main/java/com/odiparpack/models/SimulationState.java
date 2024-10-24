@@ -1,9 +1,12 @@
 package com.odiparpack.models;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import com.google.ortools.constraintsolver.Assignment;
 import com.google.ortools.constraintsolver.RoutingIndexManager;
 import com.google.ortools.constraintsolver.RoutingModel;
 import com.google.ortools.constraintsolver.RoutingSearchParameters;
+import com.odiparpack.DataLoader;
 import com.odiparpack.DataModel;
 
 import java.io.IOException;
@@ -38,6 +41,129 @@ public class SimulationState {
     private long lastModified = 0;
     // Mapa para almacenar los logs de avería por vehículo
     public static final Map<String, List<String>> breakdownLogs = new HashMap<>();
+    private Map<String, Integer> locationIndices;
+    private List<String> locationNames;
+    private List<String> locationUbigeos;
+    private long[][] timeMatrix;
+    private List<Blockage> allBlockages;
+    private volatile boolean isPaused = false;
+    private volatile boolean isStopped = false;
+
+    public void reset() {
+        // Adquirir el lock para asegurar thread safety durante el reset
+        lock.lock();
+        try {
+            System.out.println("Starting simulation reset at: " + LocalDateTime.now());
+
+            // Detener la simulación primero
+            this.stopSimulation();
+
+            // Limpiar todas las estructuras existentes por seguridad
+            if (this.routeCache != null) {
+                this.routeCache.clear();
+            }
+
+            if (this.breakdownLogs != null) {
+                this.breakdownLogs.clear();
+            }
+
+            // Recargar todos los datos
+            loadInitialData();
+
+            System.out.println("Simulation reset completed successfully");
+        } catch (Exception e) {
+            System.err.println("Error during simulation reset: " + e.getMessage());
+            e.printStackTrace();
+            throw new RuntimeException("Failed to reset simulation", e);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void loadInitialData() {
+        try {
+            System.out.println("Starting initial data reload...");
+
+            // Inicializar DataLoader
+            DataLoader dataLoader = new DataLoader();
+
+            // Cargar datos desde archivos
+            this.locations = dataLoader.loadLocations("src/main/resources/locations.txt");
+            List<Edge> edges = dataLoader.loadEdges("src/main/resources/edges.txt", this.locations);
+            List<Vehicle> vehiclesList = dataLoader.loadVehicles("src/main/resources/vehicles.txt");
+            this.orders = dataLoader.loadOrders("src/main/resources/orders.txt", this.locations);
+            this.allBlockages = dataLoader.loadBlockages("src/main/resources/blockages.txt");
+            this.maintenanceSchedule = dataLoader.loadMaintenanceSchedule("src/main/resources/maintenance.txt");
+
+            // Reinicializar el cache de rutas
+            this.routeCache = new RouteCache(ROUTE_CACHE_CAPACITY);
+
+            // Construir índices y matrices
+            List<Location> locationList = new ArrayList<>(this.locations.values());
+
+            // Reinicializar índices de ubicación
+            this.locationIndices = new HashMap<>();
+            for (int i = 0; i < locationList.size(); i++) {
+                this.locationIndices.put(locationList.get(i).getUbigeo(), i);
+            }
+
+            // Crear matriz de tiempos
+            this.timeMatrix = dataLoader.createTimeMatrix(locationList, edges);
+            this.currentTimeMatrix = Arrays.stream(this.timeMatrix)
+                    .map(row -> row.clone())
+                    .toArray(long[][]::new);
+
+            // Reinicializar listas de nombres y ubigeos
+            this.locationNames = new ArrayList<>();
+            this.locationUbigeos = new ArrayList<>();
+            for (Location loc : locationList) {
+                this.locationNames.add(loc.getProvince());
+                this.locationUbigeos.add(loc.getUbigeo());
+            }
+
+            // Convertir lista de vehículos a mapa
+            this.vehicles = vehiclesList.stream()
+                    .collect(Collectors.toMap(Vehicle::getCode, v -> v));
+
+            // Establecer tiempo inicial de simulación
+            this.currentTime = this.orders.stream()
+                    .map(Order::getOrderTime)
+                    .min(LocalDateTime::compareTo)
+                    .orElse(LocalDateTime.now())
+                    .withHour(0).withMinute(0).withSecond(0).withNano(0);
+
+            // Reinicializar otras estructuras de datos
+            this.vehiclesNeedingNewRoutes = new ArrayList<>();
+            this.activeBlockages = new ArrayList<>();
+            this.breakdownLogs.clear();
+
+            // Reinicializar el warehouse manager
+            this.warehouseManager = new WarehouseManager(this.locations);
+
+            // Reinicializar los almacenes principales
+            this.almacenesPrincipales = Arrays.asList("150101", "040201", "130101");
+
+            // Restablecer flags de control
+            this.isPaused = false;
+            this.isStopped = false;
+            this.lastModified = 0;
+
+            System.out.println("Initial data reload completed successfully");
+            System.out.println("Loaded: " +
+                    String.format("%d locations, %d vehicles, %d orders, %d blockages, %d maintenance schedules",
+                            locations.size(),
+                            vehicles.size(),
+                            orders.size(),
+                            allBlockages.size(),
+                            maintenanceSchedule.size())
+            );
+
+        } catch (Exception e) {
+            System.err.println("Error during initial data reload: " + e.getMessage());
+            e.printStackTrace();
+            throw new RuntimeException("Failed to reload initial data", e);
+        }
+    }
 
     public List<Blockage> getActiveBlockages() {
         return activeBlockages;
@@ -47,8 +173,6 @@ public class SimulationState {
         this.activeBlockages = activeBlockages;
     }
 
-
-
     public long[][] getCurrentTimeMatrix() {
         return currentTimeMatrix;
     }
@@ -57,26 +181,75 @@ public class SimulationState {
         this.currentTimeMatrix = currentTimeMatrix;
     }
 
+    public Map<String, Location> getLocations() {
+        return locations;
+    }
+
+    public void pauseSimulation() {
+        isPaused = true;
+    }
+
+    public void resumeSimulation() {
+        isPaused = false;
+    }
+
+    public void stopSimulation() {
+        isStopped = true;
+    }
+
+    public boolean isPaused() {
+        return isPaused;
+    }
+
+    public boolean isStopped() {
+        return isStopped;
+    }
+
+    public Map<String, Integer> getLocationIndices() {
+        return locationIndices;
+    }
+
+    public List<String> getLocationNames() {
+        return locationNames;
+    }
+
+    public List<String> getLocationUbigeos() {
+        return locationUbigeos;
+    }
+
+    public List<Order> getOrders() {
+        return orders;
+    }
+
+    public List<Blockage> getAllBlockages() {
+        return allBlockages;
+    }
 
 
     public SimulationState(Map<String, Vehicle> vehicleMap, LocalDateTime initialSimulationTime,
                            List<Order> orders, Map<String, Location> locations, RouteCache routeCache,
                            long[][] originalTimeMatrix, List<Blockage> blockages,
-                           List<Maintenance> maintenanceSchedule) {
+                           List<Maintenance> maintenanceSchedule,
+                           Map<String, Integer> locationIndices, List<String> locationNames, List<String> locationUbigeos) {
         this.vehicles = vehicleMap;
         this.currentTime = initialSimulationTime;
         this.orders = orders;
-        this.warehouseManager = new WarehouseManager(locations);
         this.locations = locations;
+        this.warehouseManager = new WarehouseManager(locations);
         this.routeCache = routeCache;
-        this.vehiclesNeedingNewRoutes = new ArrayList<>();
+        this.timeMatrix = originalTimeMatrix;
+        this.locationIndices = locationIndices;
+        this.locationNames = locationNames;
+        this.locationUbigeos = locationUbigeos;
+        this.maintenanceSchedule = maintenanceSchedule;
+        this.allBlockages = blockages;
         this.activeBlockages = new ArrayList<>();
         this.currentTimeMatrix = Arrays.stream(originalTimeMatrix)
                 .map(long[]::clone)
                 .toArray(long[][]::new);
-        this.maintenanceSchedule = maintenanceSchedule;
-        updateBlockages(initialSimulationTime, blockages);
+        updateBlockages(initialSimulationTime, allBlockages);
     }
+
 
     // Getter para breakdownLogs
     public Map<String, List<String>> getBreakdownLogs() {
@@ -154,7 +327,39 @@ public class SimulationState {
         logger.info("Matriz de tiempo actualizada con " + activeBlockages.size() + " bloqueos aplicados");
     }
 
-    public void updateVehicleStates(Map<String, List<RouteSegment>> vehicleRoutes) {
+    public JsonObject getCurrentPositionsGeoJSON() {
+        JsonObject featureCollection = new JsonObject();
+        featureCollection.addProperty("type", "FeatureCollection");
+        JsonArray features = new JsonArray();
+
+        for (Vehicle vehicle : vehicles.values()) {
+            Position position = vehicle.getCurrentPosition(currentTime);
+            if (position != null) {
+                JsonObject feature = new JsonObject();
+                feature.addProperty("type", "Feature");
+
+                JsonObject geometry = new JsonObject();
+                geometry.addProperty("type", "Point");
+                JsonArray coordinates = new JsonArray();
+                coordinates.add(position.getLongitude());
+                coordinates.add(position.getLatitude());
+                geometry.add("coordinates", coordinates);
+                feature.add("geometry", geometry);
+
+                JsonObject properties = new JsonObject();
+                properties.addProperty("vehicleCode", vehicle.getCode());
+                // Puedes añadir más propiedades si lo deseas
+                feature.add("properties", properties);
+
+                features.add(feature);
+            }
+        }
+
+        featureCollection.add("features", features);
+        return featureCollection;
+    }
+
+    public void updateVehicleStates() {
         lock.lock();
         try {
             List<Vehicle> vehiclesNeedingNewRoutes = new ArrayList<>();
@@ -482,7 +687,7 @@ public class SimulationState {
                 long durationMinutes = data.timeMatrix[fromNode][toNode];
                 double distance = calculateDistanceFromNodes(data, fromNode, toNode);
 
-                route.add(new RouteSegment(fromName + " to " + toName, toUbigeo, distance, durationMinutes));
+                route.add(new RouteSegment(fromName + " to " + toName, fromUbigeo, toUbigeo, distance, durationMinutes));
 
                 index = nextIndex;
             }
@@ -528,7 +733,7 @@ public class SimulationState {
         }
     }
 
-    private String findNearestWarehouse(Vehicle vehicle) {
+    /*private String findNearestWarehouse(Vehicle vehicle) {
         List<String> potentialDestinations = locations.values().stream()
                 .filter(loc -> !loc.getUbigeo().equals(vehicle.getCurrentLocationUbigeo()))
                 .map(Location::getUbigeo)
@@ -556,7 +761,7 @@ public class SimulationState {
         }
 
         return nearestWarehouse;
-    }
+    }*/
 
     private int[] getStartIndices(List<Vehicle> vehicles) {
         return vehicles.stream()

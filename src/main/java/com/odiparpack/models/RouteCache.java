@@ -124,7 +124,8 @@ public class RouteCache {
 
             RouteSegment reversedSegment = new RouteSegment(
                     fromName + " to " + toName,
-                    originalSegment.getUbigeo(),
+                    originalSegment.getToUbigeo(),
+                    originalSegment.getFromUbigeo(),
                     originalSegment.getDistance(),
                     originalSegment.getDurationMinutes()
             );
@@ -155,6 +156,23 @@ public class RouteCache {
         if (routes.size() > 5) {  // Por ejemplo, mantener solo las 5 versiones más recientes
             routes.remove(0);
         }
+    }
+
+    public void clear() {
+        logger.info("Limpiando RouteCache...");
+
+        // Registrar estado antes de limpiar
+        logger.info("Estado antes de limpiar:");
+        logger.info("  Número de rutas en caché: " + cache.size());
+        logger.info("  Número de entradas en LRU queue: " + lruQueue.size());
+
+        // Limpiar el mapa de caché
+        cache.clear();
+
+        // Limpiar la cola LRU
+        lruQueue.clear();
+
+        logger.info("RouteCache limpiado completamente");
     }
 
     private static class VersionedRoute {

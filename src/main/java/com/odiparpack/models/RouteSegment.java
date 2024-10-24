@@ -3,14 +3,17 @@ package com.odiparpack.models;
 // Clase para el segmento de la ruta
 public class RouteSegment {
     private String name;
+    private String fromUbigeo;
+    private String toUbigeo;
     private String ubigeo;
     private double distance; // km
     private long durationMinutes;
 
     // Constructor
-    public RouteSegment(String name, String ubigeo, double distance, long durationMinutes) {
+    public RouteSegment(String name, String fromUbigeo, String toUbigeo, double distance, long durationMinutes) {
         this.name = name;
-        this.ubigeo = ubigeo;
+        this.fromUbigeo = fromUbigeo;
+        this.toUbigeo = toUbigeo;
         this.distance = distance;
         this.durationMinutes = durationMinutes;
     }
@@ -19,6 +22,9 @@ public class RouteSegment {
     public String getName() {
         return name;
     }
+
+    public String getFromUbigeo() { return fromUbigeo; }
+    public String getToUbigeo() { return toUbigeo; }
 
     public void setName(String name) {
         this.name = name;
