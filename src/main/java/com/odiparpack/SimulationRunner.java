@@ -13,8 +13,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
-import static com.odiparpack.Main.locationIndices;
-import static com.odiparpack.Main.routeCache;
+import static com.odiparpack.Main.*;
 import static com.odiparpack.Utils.calculateDistanceFromNodes;
 import static com.odiparpack.Utils.formatTime;
 
@@ -273,16 +272,229 @@ public class SimulationRunner {
             return;
         }
 
-        DataModel data = new DataModel(currentTimeMatrix, state.getActiveBlockages(), assignments, locationIndices, locationNames, locationUbigeos);
+        // Filtrar asignaciones por destino único
+        Map<String, List<VehicleAssignment>> assignmentGroups = groupAssignmentsByOriginDestination(assignments);
+
+        // Crear las asignaciones filtradas
+        List<VehicleAssignment> filteredAssignments = new ArrayList<>();
+        for (List<VehicleAssignment> group : assignmentGroups.values()) {
+            filteredAssignments.add(group.get(0)); // Tomar una asignación por grupo
+        }
+
+        // Crear el modelo de datos con las asignaciones filtradas
+        DataModel data = new DataModel(currentTimeMatrix, state.getActiveBlockages(), filteredAssignments, locationIndices, locationNames, locationUbigeos);
+
         executorService.submit(() -> {
             try {
-                Map<String, List<RouteSegment>> newRoutes = calculateRoute(data, data.starts, data.ends, state);
+                Map<String, List<RouteSegment>> newRoutes = calculateRouteWithStrategies(data, state, assignmentGroups);
                 vehicleRoutes.putAll(newRoutes);
                 logger.info("Nuevas rutas calculadas y agregadas en tiempo de simulación: " + state.getCurrentTime());
             } catch (Exception e) {
                 logger.log(Level.SEVERE, "Error durante el cálculo de rutas", e);
             }
         });
+    }
+
+    private static Map<String, List<RouteSegment>> calculateRouteWithStrategies(DataModel data, SimulationState state, Map<String, List<VehicleAssignment>> assignmentGroups) {
+        logger.info("\n--- Inicio del cálculo de rutas con estrategias ---");
+        Map<String, List<RouteSegment>> allRoutes = new HashMap<>();
+
+        try {
+            // Intentar resolver con las estrategias definidas
+            Map<String, List<RouteSegment>> routes = trySolvingWithStrategies(data, Arrays.asList(
+                    FirstSolutionStrategy.Value.CHRISTOFIDES,
+                    FirstSolutionStrategy.Value.PATH_CHEAPEST_ARC
+            ));
+
+            if (routes != null && !routes.isEmpty()) {
+                allRoutes.putAll(routes);
+            } else {
+                // Si no se encuentra solución, dividir y resolver
+                List<SolutionData> solutions = Collections.synchronizedList(new ArrayList<>());
+                divideAndSolve(data.assignments, Arrays.asList(
+                        FirstSolutionStrategy.Value.CHRISTOFIDES,
+                        FirstSolutionStrategy.Value.PATH_CHEAPEST_ARC
+                ), solutions);
+
+                // Combinar soluciones
+                for (SolutionData solutionData : solutions) {
+                    allRoutes.putAll(solutionData.routes);
+                }
+            }
+
+            // Asignar rutas a todos los vehículos en los grupos correspondientes
+            applyRoutesToVehiclesWithGroups(data, allRoutes, assignmentGroups, state);
+
+            return allRoutes;
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error durante el cálculo de rutas con estrategias.", e);
+            return allRoutes;
+        } finally {
+            logger.info("--- Fin del cálculo de rutas con estrategias ---\n");
+        }
+    }
+
+    private static Map<String, List<RouteSegment>> trySolvingWithStrategies(DataModel data, List<FirstSolutionStrategy.Value> strategies) {
+        for (FirstSolutionStrategy.Value strategy : strategies) {
+            try {
+                RoutingIndexManager manager = createRoutingIndexManager(data, data.starts, data.ends);
+                RoutingModel routing = createRoutingModel(manager, data);
+                RoutingSearchParameters searchParameters = Main.createSearchParameters(strategy);
+
+                logger.info("Intentando resolver con estrategia: " + strategy);
+                Assignment solution = routing.solveWithParameters(searchParameters);
+
+                if (solution != null) {
+                    logger.info("Solución encontrada con estrategia: " + strategy);
+                    Map<String, List<RouteSegment>> routes = extractCalculatedRoutes(data.activeBlockages, manager, data, data.assignments, routing, solution);
+                    return routes;
+                } else {
+                    logger.info("No se encontró solución con estrategia: " + strategy);
+                }
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "Error al resolver con estrategia: " + strategy, e);
+            }
+        }
+        return null; // No se encontró solución con las estrategias dadas
+    }
+
+    public static void divideAndSolve(List<VehicleAssignment> assignments, List<FirstSolutionStrategy.Value> strategies, List<Main.SolutionData> solutions) {
+        if (assignments == null || strategies == null || solutions == null) {
+            throw new IllegalArgumentException("Los argumentos no pueden ser nulos.");
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+        int maxDepth = 10;
+        try {
+            Future<?> future = executor.submit(() ->
+                    processSubset(assignments, strategies, solutions, executor, 0, maxDepth)
+            );
+
+            future.get();
+
+        } catch (InterruptedException | ExecutionException e) {
+            logger.log(Level.SEVERE, "Error en la ejecución del proceso de resolución.", e);
+        } finally {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    private static void processSubset(List<VehicleAssignment> subset,
+                                      List<FirstSolutionStrategy.Value> strategies,
+                                      List<SolutionData> solutions,
+                                      ExecutorService executor,
+                                      int depth,
+                                      int maxDepth) {
+        if (depth > maxDepth) {
+            logger.warning("Profundidad máxima alcanzada. Deteniendo la división de subconjuntos.");
+            return;
+        }
+
+        if (subset.size() <= 1) {
+            logger.info("No se puede dividir más. Pedido conflictivo detectado.");
+            return;
+        }
+
+        for (FirstSolutionStrategy.Value strategy : strategies) {
+            logger.info("Intentando resolver subconjunto con estrategia: " + strategy);
+
+            RoutingResult result = solveSubset(subset, strategy);
+
+            if (result != null && result.solution != null) {
+                logger.info("Solución encontrada para el subconjunto con estrategia: " + strategy);
+
+                // Crear una instancia de SolutionData con los resultados obtenidos
+                SolutionData solutionData = new SolutionData(result.solution, result.routingModel, result.manager, result.data);
+                solutions.add(solutionData);
+
+                return;
+            } else {
+                logger.info("No se encontró solución para el subconjunto con estrategia: " + strategy);
+            }
+        }
+
+        // Si ninguna estrategia resolvió el subconjunto, dividirlo nuevamente
+        logger.info("Todas las estrategias fallaron para el subconjunto. Dividiendo nuevamente...");
+
+        int mid = subset.size() / 2;
+        List<VehicleAssignment> firstHalf = new ArrayList<>(subset.subList(0, mid));
+        List<VehicleAssignment> secondHalf = new ArrayList<>(subset.subList(mid, subset.size()));
+
+        // Procesar cada mitad de manera concurrente
+        Future<?> futureFirst = executor.submit(() ->
+                processSubset(firstHalf, strategies, solutions, executor, depth + 1, maxDepth)
+        );
+
+        Future<?> futureSecond = executor.submit(() ->
+                processSubset(secondHalf, strategies, solutions, executor, depth + 1, maxDepth)
+        );
+
+        try {
+            // Esperar a que ambas mitades se procesen
+            futureFirst.get();
+            futureSecond.get();
+        } catch (InterruptedException | ExecutionException e) {
+            logger.log(Level.SEVERE, "Error al procesar los subconjuntos divididos.", e);
+        }
+    }
+
+    private static RoutingResult solveSubset(List<VehicleAssignment> subset, FirstSolutionStrategy.Value strategy) {
+        try {
+            DataModel data = new DataModel(timeMatrix, new ArrayList<>(), subset, locationIndices, locationNames, locationUbigeos);
+            RoutingIndexManager manager = createRoutingIndexManager(data, data.starts, data.ends);
+            RoutingModel routing = createRoutingModel(manager, data);
+            RoutingSearchParameters searchParameters = Main.createSearchParameters(strategy);
+
+            Assignment solution = routing.solveWithParameters(searchParameters);
+
+            if (solution != null) {
+                logger.info("Solución encontrada para el subconjunto con estrategia: " + strategy);
+                return new RoutingResult(solution, routing, manager, data);
+            } else {
+                logger.info("No se encontró solución para el subconjunto con estrategia: " + strategy);
+                return null;
+            }
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Error al resolver el subconjunto con estrategia: " + strategy, e);
+            return null;
+        }
+    }
+
+    private static void applyRoutesToVehiclesWithGroups(DataModel data, Map<String, List<RouteSegment>> allRoutes, Map<String, List<VehicleAssignment>> assignmentGroups, SimulationState state) {
+        for (String key : assignmentGroups.keySet()) {
+            List<VehicleAssignment> group = assignmentGroups.get(key);
+            VehicleAssignment representativeAssignment = group.get(0);
+            Vehicle representativeVehicle = representativeAssignment.getVehicle();
+            List<RouteSegment> route = allRoutes.get(representativeVehicle.getCode());
+            if (route != null) {
+                for (VehicleAssignment assignment : group) {
+                    Vehicle vehicle = assignment.getVehicle();
+                    vehicle.setRoute(route);
+                    if (state != null) {
+                        vehicle.startJourney(state.getCurrentTime(), assignment.getOrder());
+                    }
+                    logger.info("Vehículo " + vehicle.getCode() + " iniciando viaje a " + assignment.getOrder().getDestinationUbigeo());
+                }
+            } else {
+                logger.warning("No se encontró ruta para el grupo con origen-destino " + key);
+            }
+        }
+    }
+
+    public static Map<String, List<VehicleAssignment>> groupAssignmentsByOriginDestination(List<VehicleAssignment> assignments) {
+        Map<String, List<VehicleAssignment>> assignmentGroups = new HashMap<>();
+        for (VehicleAssignment assignment : assignments) {
+            String key = assignment.getVehicle().getCurrentLocationUbigeo() + "-" + assignment.getOrder().getDestinationUbigeo();
+            assignmentGroups.computeIfAbsent(key, k -> new ArrayList<>()).add(assignment);
+        }
+        return assignmentGroups;
     }
 
     public static Map<String, List<RouteSegment>> calculateRoute(DataModel data, int[] start, int[] end, SimulationState state) {
@@ -613,9 +825,4 @@ public class SimulationRunner {
         logger.info("Máximo tiempo de las rutas: " + formatTime(maxRouteTime));
         //totalDeliveryTime = localTotalTime;
     }
-
-    // Métodos auxiliares como getAvailableOrders, logAvailableOrders, assignOrdersToVehicles, calculateAndApplyRoutes
-    // deben ser implementados o referenciados desde la clase Main o Utils.
-
-    // Implementa los métodos auxiliares aquí o ajusta según tu estructura de paquetes.
 }

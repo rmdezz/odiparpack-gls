@@ -1,0 +1,4 @@
+--- Métricas de Ejecución ---
+Tiempo total de entrega acumulado: 42614 minutos
+Tiempo transcurrido en resolver las rutas: 60102 ms
+
