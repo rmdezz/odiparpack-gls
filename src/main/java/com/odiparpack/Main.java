@@ -1,24 +1,17 @@
 package com.odiparpack;
 
-import com.codahale.metrics.ConsoleReporter;
-import com.codahale.metrics.Meter;
-import com.codahale.metrics.MetricRegistry;
 import com.google.ortools.Loader;
 import com.google.ortools.constraintsolver.*;
+import com.odiparpack.api.controller.SimulationController;
 import com.odiparpack.models.*;
 
 import java.io.BufferedWriter;
 import java.io.FileWriter;
 import java.lang.management.ManagementFactory;
 
-import com.odiparpack.services.DataService;
-import com.odiparpack.simulation.SimulationEngine;
-import com.odiparpack.simulation.state.SimulationComponents;
-import com.odiparpack.simulation.state.SimulationInitializer;
 import com.odiparpack.simulation.state.SimulationState;
 import com.sun.management.OperatingSystemMXBean;
 
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -26,7 +19,6 @@ import java.text.DecimalFormat;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
@@ -99,7 +91,7 @@ public class Main {
         SimulationEngine simulationEngine = new SimulationEngine(simulationState);
 
         // Iniciar el controlador de la simulación (servidor web) para manejar las APIs REST y comunicaciones WebSocket
-        com.odiparpack.SimulationController simulationController = new com.odiparpack.SimulationController(simulationState, simulationEngine);
+        com.odiparpack.api.controller.SimulationController simulationController = new com.odiparpack.api.controller.SimulationController(simulationState, simulationEngine);
         simulationController.start();
 
         // El método main termina aquí
@@ -826,12 +818,51 @@ public class Main {
 
 
     // Estructura para almacenar los datos de la solución
-    static class SolutionData {
+    public static class SolutionData {
         public long objectiveValue;
         public Map<String, List<RouteSegment>> routes; // Mapa de rutas por vehículo
         public Map<String, Long> routeTimes;            // Mapa para almacenar el tiempo total de cada ruta
         public long maxRouteTime;
 
+        // Constructor que acepta los objetos de OR-Tools y extrae la información necesaria
+        public SolutionData(Assignment solution, RoutingModel routingModel, RoutingIndexManager manager, DataModel data) {
+            this.routes = new HashMap<>();
+            this.routeTimes = new HashMap<>();
+            this.maxRouteTime = 0;
+            this.objectiveValue = solution.objectiveValue();
+
+            for (int i = 0; i < data.vehicleNumber; ++i) {
+                long index = routingModel.start(i);
+                List<RouteSegment> route = new ArrayList<>();
+                long routeTime = 0;
+
+                while (!routingModel.isEnd(index)) {
+                    long previousIndex = index;
+                    index = solution.value(routingModel.nextVar(index));
+
+                    int fromNode = manager.indexToNode(previousIndex);
+                    int toNode = manager.indexToNode(index);
+
+                    String fromName = data.locationNames.get(fromNode);
+                    String fromUbigeo = data.locationUbigeos.get(fromNode);
+                    String toName = data.locationNames.get(toNode);
+                    String toUbigeo = data.locationUbigeos.get(toNode);
+
+                    long durationMinutes = data.timeMatrix[fromNode][toNode];
+                    double distance = calculateDistanceFromNodes(data, fromNode, toNode);
+
+                    route.add(new RouteSegment(fromName + " to " + toName, fromUbigeo, toUbigeo, distance, durationMinutes));
+                    routeTime += durationMinutes;
+                }
+
+                String vehicleCode = data.assignments.get(i).getVehicle().getCode();
+                this.routes.put(vehicleCode, route);
+                this.routeTimes.put(vehicleCode, routeTime);
+                this.maxRouteTime = Math.max(this.maxRouteTime, routeTime);
+            }
+        }
+
+        // Constructor por defecto (si aún lo necesitas)
         public SolutionData() {
             this.routes = new HashMap<>();
             this.routeTimes = new HashMap<>();
